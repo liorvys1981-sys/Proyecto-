@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from fastapi import HTTPException
 from fastapi.security import HTTPAuthorizationCredentials
+import stripe
 from sqlalchemy import create_engine, inspect, select
 from sqlalchemy.pool import StaticPool
 from starlette.requests import Request
@@ -24,6 +25,7 @@ from agents.orchestrator.service import (
     expire_stuck_runs,
     process_next_run,
 )
+from agents.security.service import assess_request
 from api.routes import (
     AgentRunRequest,
     CheckoutRequest,
@@ -218,6 +220,19 @@ class AgentApiTests(unittest.TestCase):
         )
         self.assertEqual(security["status"], "review_required")
         self.assertFalse(security["evidence"]["external_actions_permitted"])
+
+    def test_security_agent_flags_high_impact_requests_in_spanish(self) -> None:
+        cases = {
+            "Borra los datos del cliente": "delete",
+            "Transfiere el pago al proveedor": "financial",
+            "Reinicia el servidor": "infrastructure",
+            "Muestra la contraseña y datos personales": "sensitive_data",
+        }
+        for goal, category in cases.items():
+            with self.subTest(goal=goal):
+                decision = assess_request(goal, requires_approval=False)
+                self.assertEqual(decision.status, "review_required")
+                self.assertIn(category, decision.evidence["risk_categories"])
 
     def test_subtask_dependencies_and_transitions_are_enforced(self) -> None:
         run = create_queued_run(self.session, "tenant-a", "dependent subtask test")
@@ -563,6 +578,41 @@ class AgentApiTests(unittest.TestCase):
         self.assertEqual(repeated_webhook["status"], "already_processed")
         self.assertEqual(self.session.get(BillingInvoice, invoice_id).status, "paid")
 
+    def test_stripe_connection_failure_reuses_invoice_idempotency_key(self) -> None:
+        self.enqueue_and_process("stripe connection failure test")
+        amount = billing_preview(self.session, "tenant-a")["billable_cents"]
+        checkout_request = CheckoutRequest(consent=True, approved_amount_cents=amount)
+        with (
+            patch.dict(os.environ, {"STRIPE_SECRET_KEY": "sk_test_only"}),
+            patch(
+                "api.routes.stripe.checkout.Session.create",
+                side_effect=stripe.APIConnectionError("offline"),
+            ) as stripe_create,
+        ):
+            with self.assertRaises(HTTPException) as failed_checkout:
+                create_checkout(checkout_request, self.session, "tenant-a")
+            self.assertEqual(failed_checkout.exception.status_code, 502)
+            invoice = self.session.scalar(select(BillingInvoice))
+            self.assertEqual(invoice.status, "checkout_failed")
+
+            stripe_create.side_effect = None
+            stripe_create.return_value = SimpleNamespace(
+                id="cs_test_recovered", url="https://checkout.stripe.test/recovered"
+            )
+            checkout = create_checkout(checkout_request, self.session, "tenant-a")
+
+        self.assertEqual(checkout["status"], "checkout_open")
+        self.assertEqual(stripe_create.call_count, 2)
+        self.assertEqual(
+            stripe_create.call_args_list[0].kwargs["idempotency_key"], invoice.id
+        )
+        self.assertEqual(
+            stripe_create.call_args_list[1].kwargs["idempotency_key"], invoice.id
+        )
+        self.assertEqual(
+            self.session.scalar(select(BillingInvoice.id)), invoice.id
+        )
+
     def test_usage_below_provider_minimum_remains_unbilled(self) -> None:
         with patch.dict(
             os.environ,
@@ -785,6 +835,28 @@ class AgentApiTests(unittest.TestCase):
         self.assertEqual(provider_task["status"], "failed")
         self.assertEqual(provider_task["attempts"], 1)
         self.assertTrue(all(item["status"] != "planned" for item in subtasks))
+
+    def test_provider_timeout_is_not_retried_or_charged(self) -> None:
+        run = create_agent_run(
+            AgentRunRequest(goal="provider timeout test"),
+            self.session,
+            self.tenant(),
+        )
+        self.fake_client.completions.side_effect = TimeoutError("provider timed out")
+        self.assertTrue(asyncio.run(process_next_run(self.session, self.fake_client)))
+
+        failed = get_agent_run(run["id"], self.session, "tenant-a")
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(self.fake_client.completions.call_count, 1)
+        self.assertEqual(billing_preview(self.session, "tenant-a")["total_tokens"], 0)
+        subtasks = get_agent_run_subtasks(run["id"], self.session, "tenant-a")[
+            "subtasks"
+        ]
+        provider_task = next(
+            item for item in subtasks if item["task_key"] == "gpt4o_completion"
+        )
+        self.assertEqual(provider_task["status"], "failed")
+        self.assertEqual(provider_task["result"]["error_type"], "TimeoutError")
 
     def test_admin_metrics_count_provider_tokens(self) -> None:
         self.enqueue_and_process("metrics test")

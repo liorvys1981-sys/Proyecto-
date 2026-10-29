@@ -1,17 +1,76 @@
+import unicodedata
+
 from agents.contracts import AgentDecision
 
 
 def assess_request(goal: str, requires_approval: bool) -> AgentDecision:
+    normalized_goal = "".join(
+        character
+        for character in unicodedata.normalize("NFKD", goal.casefold())
+        if not unicodedata.combining(character)
+    )
     risk_terms = {
-        "delete": ("delete", "erase", "drop database"),
-        "financial": ("payment", "transfer", "purchase", "refund", "charge"),
-        "infrastructure": ("deploy", "restart server", "change firewall"),
-        "sensitive_data": ("password", "secret key", "personal data"),
+        "delete": (
+            "delete",
+            "erase",
+            "drop database",
+            "drop table",
+            "elimina",
+            "eliminar",
+            "borra",
+            "borrar",
+            "suprime",
+            "suprimir",
+            "destruye",
+            "destruir",
+        ),
+        "financial": (
+            "payment",
+            "transfer",
+            "transfiere",
+            "transferir",
+            "purchase",
+            "refund",
+            "charge",
+            "pago",
+            "pagar",
+            "compra",
+            "comprar",
+            "reembolso",
+            "devolucion",
+            "reembolsar",
+            "cobrar",
+            "cargo",
+        ),
+        "infrastructure": (
+            "deploy",
+            "restart server",
+            "change firewall",
+            "desplegar",
+            "reiniciar servidor",
+            "reiniciar el servidor",
+            "reinicia servidor",
+            "reinicia el servidor",
+            "cambiar firewall",
+            "cortafuegos",
+        ),
+        "sensitive_data": (
+            "password",
+            "secret key",
+            "personal data",
+            "contrasena",
+            "clave secreta",
+            "clave api",
+            "datos personales",
+            "datos sensibles",
+            "informacion personal",
+            "informacion confidencial",
+        ),
     }
     categories = sorted(
         category
         for category, terms in risk_terms.items()
-        if any(term in goal.casefold() for term in terms)
+        if any(term in normalized_goal for term in terms)
     )
     return AgentDecision(
         agent="security",
