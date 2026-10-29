@@ -18,6 +18,8 @@ from config.settings import (
     max_monthly_tokens_per_tenant,
     max_output_tokens,
     max_queued_runs_per_tenant,
+    openai_input_cost_micro_usd_per_million,
+    openai_output_cost_micro_usd_per_million,
     setting,
     tenant_api_keys,
     token_price_tiers,
@@ -147,6 +149,7 @@ def _usage_summary(session: Session, tenant_id: str) -> dict:
         select(UsageRecord).where(
             UsageRecord.tenant_id == tenant_id,
             UsageRecord.invoice_id.is_(None),
+            UsageRecord.feature == "text_completion",
         )
     ).all()
     provider_cost_micro_usd = sum(
@@ -173,6 +176,12 @@ def _usage_summary(session: Session, tenant_id: str) -> dict:
         ),
         "provider_cost_micro_usd": provider_cost_micro_usd,
         "sell_price_micro_usd": sell_price_micro_usd,
+        "provider_input_micro_usd_per_million": (
+            openai_input_cost_micro_usd_per_million()
+        ),
+        "provider_output_micro_usd_per_million": (
+            openai_output_cost_micro_usd_per_million()
+        ),
         "price_tiers": token_price_tiers(),
         "events": [
             {
@@ -216,6 +225,13 @@ def create_agent_run(
         raise HTTPException(
             status_code=503, detail="GPT-4o worker is not configured"
         )
+    if session.get_bind().dialect.name == "postgresql":
+        session.execute(
+            text(
+                "SELECT pg_advisory_xact_lock(hashtextextended(:tenant_id, 0))"
+            ),
+            {"tenant_id": tenant_id},
+        )
     try:
         validate_token_pricing()
     except RuntimeError as error:
@@ -246,7 +262,10 @@ def create_agent_run(
     reserved_tokens = session.scalar(
         select(
             func.coalesce(
-                func.sum(func.length(AgentRunRecord.goal) + max_output_tokens()), 0
+                func.sum(
+                    func.length(AgentRunRecord.goal) * 4 + max_output_tokens()
+                ),
+                0,
             )
         ).where(
             AgentRunRecord.tenant_id == tenant_id,
@@ -257,7 +276,7 @@ def create_agent_run(
     if (
         monthly_tokens
         + reserved_tokens
-        + len(request.goal)
+        + len(request.goal) * 4
         + max_output_tokens()
         > max_monthly_tokens_per_tenant()
     ):
@@ -365,6 +384,7 @@ def create_checkout(
             .where(
                 UsageRecord.tenant_id == tenant_id,
                 UsageRecord.invoice_id.is_(None),
+                UsageRecord.feature == "text_completion",
             )
             .with_for_update(skip_locked=True)
         ).all()

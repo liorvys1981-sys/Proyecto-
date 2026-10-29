@@ -13,6 +13,7 @@ COPY --chown=app:app app ./app
 COPY --chown=app:app api ./api
 COPY --chown=app:app agents ./agents
 COPY --chown=app:app config ./config
+COPY --chown=app:app core ./core
 COPY --chown=app:app database ./database
 COPY --chown=app:app monitoring ./monitoring
 

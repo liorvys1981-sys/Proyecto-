@@ -1,73 +1,87 @@
-# YIMI — SaaS multi-tenant de agentes autónomos
+# YIMI — SaaS multi-tenant con agente GPT-4o
 
-API FastAPI inspirada en la organización de alto nivel de [ECO.IA](https://github.com/lio366/ECO.IA): agentes, API, configuración, base de datos, Docker, monitoreo y pruebas. Se adaptó la estructura; no se clonó ni copió el código fuente del otro repositorio.
+Servicio FastAPI con cola persistente y un único proveedor de IA: **GPT-4o**. Los demás módulos realizan solo funciones locales de cola, medición, seguridad y cobro; no llaman a otros modelos ni tienen herramientas para operar sistemas externos.
 
-## Estructura
+La organización toma como referencia conceptual la estructura de [ECO.IA](https://github.com/lio366/ECO.IA), pero se implementó en este repositorio y no se clonó su código. No encontré un repositorio público inequívoco llamado “Yimi cloud free”; para adoptar uno concreto necesito su URL.
 
-```text
-agents/       analítica, riesgos, recursos, monetización y orquestación
-api/          rutas HTTP, autenticación, cobro y aprobación
-app/          punto de entrada FastAPI y ciclo de vida supervisado
-config/       tarifas y lectura de variables de entorno
-database/     modelos y sesiones SQLAlchemy
-docker/       Compose y proxy inverso
-monitoring/   salud de agentes y configuración Prometheus
-tests/        pruebas automatizadas
-```
+## Capacidades
 
-## Funcionalidad y límites
+- `POST /v1/agent-runs` encola una tarea durable y responde `202`. El worker la procesa usando una única llamada a `gpt-4o`, con salida limitada, sin herramientas y sin reintentos automáticos del SDK.
+- `GET /v1/agent-runs/{id}` consulta estado y resultado de una tarea del tenant autenticado: `queued`, `processing`, `completed`, `pending_approval` o `failed`.
+- `GET /v1/billing/preview` muestra tokens de entrada/salida, costo estimado del proveedor, precio de venta por nivel y margen estimado para consumos todavía no facturados.
+- `POST /v1/billing/checkout` cobra mediante Stripe solo tras consentimiento explícito y confirmación del importe exacto mostrado. El cliente confirma el pago en Stripe; nunca hay un cargo silencioso.
+- `/v1/billing/webhook` verifica firma, factura, tenant, sesión, importe, moneda y estado de pago; evita procesar el mismo evento más de una vez.
+- Endpoints administrativos muestran salud de worker, cola y métricas globales; requieren `X-Admin-Key`. Prometheus lee su credencial de un archivo protegido configurado en `monitoring/prometheus.yml`.
+- Las operaciones que pidan aprobación quedan en espera. La aprobación es informativa: el agente no dispone de herramientas para ejecutar acciones reales.
 
-- `POST /v1/agent-runs`: ejecuta análisis y evaluación simulados; mide CPU y memoria del proceso por agente, y registra uso/costos por tenant en PostgreSQL.
-- `GET /v1/agent-runs/{id}`: lectura limitada al tenant autenticado.
-- `GET /v1/billing/preview`: muestra cargos pendientes, CPU por función, costos operativos estimados y margen estimado.
-- `POST /v1/billing/checkout`: crea Checkout de Stripe **solo** si el cliente envía `consent: true`, confirma el importe exacto de la vista previa y Stripe está configurado. Se conserva la fecha de consentimiento. El cliente confirma el pago en Stripe; la API no cobra silenciosamente.
-- `POST /v1/billing/webhook`: valida firma y verifica importe, moneda e ID de sesión antes de marcar una factura pagada. Los eventos repetidos son idempotentes.
-- `/v1/admin/health`, `/v1/admin/agents`, `/v1/admin/metrics` y `/metrics`: salud, alertas por heartbeat vencido y métricas globales; requieren clave administrativa.
-- `requires_approval: true` deja la acción en espera. Un administrador puede aprobar **solo la simulación**; aún no se ejecutan acciones externas.
+## Arranque local
 
-El uso de CPU se mide por hilo; la memoria pico es una métrica global de proceso visible solo para administradores. El margen y los costos son estimaciones, no medición de energía ni garantía de beneficios. Los agentes son simulados; el proceso mantiene health checks pero no ejecuta tareas autónomas programadas en segundo plano, ni ofrece IA, trading o ejecución de tareas externas.
-
-## Desarrollo local
-
-Requiere Python 3.12 o posterior y PostgreSQL para persistencia compartida. SQLite se usa de forma predeterminada solo para desarrollo de un proceso.
+Requiere Python 3.12 o posterior, una API key de OpenAI y PostgreSQL para persistencia compartida. SQLite se utiliza por defecto para desarrollo de un solo proceso.
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-export TENANT_API_KEYS='{"empresa-demo":"clave-local"}'
-export ADMIN_API_KEY='clave-admin-local'
+export TENANT_API_KEYS='{"empresa-demo":"clave-del-tenant"}'
+export ADMIN_API_KEY='clave-admin'
+export OPENAI_API_KEY='clave-de-openai'
 uvicorn app.main:app --reload
 ```
 
-Abre `http://localhost:8000/docs`. Genera claves con `python -c "import secrets; print(secrets.token_urlsafe(32))"`; no reutilices las claves de ejemplo.
+La cola solo procesa tareas si `OPENAI_API_KEY` está configurada; sin ella, los endpoints de tarea devuelven `503`. Documentación interactiva: `http://localhost:8000/docs`.
 
-## Docker con dos API y PostgreSQL persistente
+Ejemplo de uso:
+
+```bash
+curl -X POST http://localhost:8000/v1/agent-runs \
+  -H 'Content-Type: application/json' \
+  -H 'X-Tenant-ID: empresa-demo' \
+  -H "Authorization: $AUTH_HEADER" \
+  -d '{"goal":"Resume las métricas de este servicio"}'
+```
+
+`AUTH_HEADER` debe contener la credencial HTTP completa para el tenant. La respuesta contiene un ID; consulta `GET /v1/agent-runs/{id}` hasta que finalice.
+
+## Docker: worker 24/7 supervisado
 
 ```bash
 cp .env.example .env
-# Sustituye las claves de ejemplo; configura las credenciales de Stripe solo si quieres usar Checkout.
+# Configura OPENAI_API_KEY, claves aleatorias y credenciales de Stripe si las usarás.
 docker compose --env-file .env -f docker/docker-compose.yml up --build -d
 docker compose --env-file .env -f docker/docker-compose.yml ps
 ```
 
-El Compose inicia PostgreSQL con volumen, dos réplicas de API, Nginx, límites de CPU/memoria y políticas `restart: unless-stopped`. El volumen sobrevive a reinicios del contenedor, pero no sustituye copias de seguridad. La base de datos es una única instancia: alta disponibilidad real requiere PostgreSQL administrado/redundante, backups probados, TLS, secretos externos y un orquestador con health checks.
+Compose mantiene dos procesos API/worker con `restart: unless-stopped`, una cola PostgreSQL persistente y Nginx. Cada worker reclama trabajos mediante una actualización atómica para evitar que ambas réplicas procesen la misma tarea. Trabajos que quedan atascados se marcan fallidos y no se repiten automáticamente: así se evita una segunda llamada/costo potencial. Si la conexión se pierde después de que OpenAI haya procesado una petición, el proveedor podría haber cobrado aunque YIMI no recibiera el uso para registrarlo; revisa esos fallos antes de reenviar.
 
-No uses las claves de `.env.example` en producción. `TENANT_API_KEYS` es un objeto JSON de ID de tenant a clave. `ADMIN_API_KEY` protege endpoints administrativos. No guardes `.env` ni secretos en el repositorio.
+Esto da operación supervisada mientras el host, Docker, red, OpenAI y base de datos estén disponibles; **no garantiza un SLA ni disponibilidad real 24/7**. En esta configuración Nginx y PostgreSQL siguen siendo puntos únicos de fallo. Para producción usa base de datos administrada con alta disponibilidad, backups probados, TLS, secretos administrados y monitoreo externo. No guardes `.env` en Git.
 
-## Tarifas y medición
+## Costos de GPT-4o y precios de venta
 
-`PRICE_CENTS_PER_CPU_SECOND` y `COST_CENTS_PER_CPU_SECOND` son objetos JSON por función, por ejemplo `{"goal_analysis":2,"risk_assessment":2}`. Importes en centavos USD por segundo de CPU, redondeados hacia arriba al centavo. La vista previa acumula uso aún no facturado; los cargos menores al mínimo de Stripe se pueden acumular antes del Checkout.
+Los valores iniciales configurables de costo del proveedor son **US$2.50/1M tokens de entrada** y **US$10/1M tokens de salida**. Verifica los precios vigentes de [OpenAI](https://platform.openai.com/docs/pricing) antes de desplegar; los valores no se actualizan automáticamente. Una API key de OpenAI factura el uso al propietario de esa cuenta.
 
-Para cobro real, configura `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_SUCCESS_URL` y `STRIPE_CANCEL_URL`; registra en Stripe el webhook `/v1/billing/webhook` para `checkout.session.completed` y `checkout.session.expired`. Envía a `/v1/billing/checkout` el consentimiento y el importe exacto mostrado en la vista previa (por ejemplo, `{"consent":true,"approved_amount_cents":100}`); si el importe cambió, vuelve a mostrar la vista previa antes de confirmar. Prueba primero en modo de prueba de Stripe. No se guarda ningún dato de tarjeta.
+`TOKEN_PRICE_TIERS_JSON` define el margen sobre el costo vigente según tokens acumulados por tenant en el mes. La configuración de ejemplo aplica 30% desde 0 tokens, 35% desde 100.000 y 50% desde 500.000. El nuevo nivel se aplica a usos futuros, no altera facturas ya creadas. `GET /v1/billing/preview` enseña costo y precio antes de facturar.
 
-## Operación y monitoreo
+Las tarifas usan microdólares para acumular fracciones de centavo. Stripe factura el total redondeado al centavo y los importes inferiores al mínimo de Stripe se acumulan. Para confirmar un pago, envía el importe exacto que devolvió la vista previa:
 
-`GET /health` prueba conexión a la base. El proceso de API mantiene heartbeats; si un agente deja de reportar por más de 120 segundos, el endpoint administrativo lo marca como obsoleto. El orquestador nunca reintenta acciones externas porque todavía no las ejecuta. Los errores se registran en la respuesta del servicio, no se ocultan como éxitos.
+```json
+{"consent": true, "approved_amount_cents": 100}
+```
 
-`monitoring/prometheus.yml` muestra cómo consultar `/metrics`; configura el archivo `/etc/prometheus/secrets/admin-key` protegido con el mismo valor de `ADMIN_API_KEY`. No expongas directamente métricas administrativas a Internet.
+El ejemplo corresponde a US$1.00; usa el valor real del preview, no copies el ejemplo. Configura `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_SUCCESS_URL` y `STRIPE_CANCEL_URL`; prueba primero en modo de test. YIMI no almacena datos de tarjetas.
 
-`docker compose` aporta reinicios y dos procesos API, no garantiza un SLA 24/7: proxy y PostgreSQL local siguen siendo puntos únicos de fallo. La creación automática de tablas es una comodidad inicial; usa migraciones versionadas antes de actualizar esquemas en producción.
+Límites protectores configurables:
+
+- `MAX_OUTPUT_TOKENS=800`: máximo de salida por llamada GPT-4o.
+- `MAX_MONTHLY_TOKENS_PER_TENANT=1000000`: presupuesto preventivo mensual por tenant; cuenta tokens consumidos y reserva conservadoramente caracteres de prompts y salida máxima para tareas en cola.
+- `MAX_QUEUED_RUNS_PER_TENANT=10`: limita trabajos pendientes o procesándose a la vez por tenant.
+
+Los cálculos de costo y margen se basan en tarifas configuradas, no en la factura final del proveedor; no garantizan ganancias. El gasto de infraestructura (servidor, base de datos, Stripe, red) es aparte del costo de tokens.
+
+## Seguridad, recuperación y monitoreo
+
+Los prompts se envían a OpenAI para generar respuestas. No se envían herramientas ni permisos para realizar compras, trading, despliegues u operaciones externas. Un fallo del proveedor marca la tarea como `failed` sin reintento automático.
+
+`GET /health` prueba la base de datos. `/v1/admin/health` informa heartbeats obsoletos después de 120 segundos; `/v1/admin/metrics` muestra tokens y costos estimados. `monitoring/prometheus.yml` es una plantilla de scrape; configura `/etc/prometheus/secrets/admin-key` con una credencial protegida.
 
 ## Pruebas
 

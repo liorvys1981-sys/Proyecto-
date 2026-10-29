@@ -11,6 +11,8 @@ from unittest.mock import patch
 
 from fastapi import HTTPException
 from fastapi.security import HTTPAuthorizationCredentials
+from sqlalchemy import create_engine, inspect
+from sqlalchemy.pool import StaticPool
 from starlette.requests import Request
 
 os.environ["DATABASE_URL"] = "sqlite://"
@@ -35,7 +37,7 @@ from api.routes import (
 )
 from config.settings import token_price_tiers
 from database.models import Base, BillingInvoice
-from database.session import get_engine, get_session_factory
+from database.session import get_engine, get_session_factory, initialize_database
 from monitoring.health import agent_health
 
 
@@ -287,6 +289,68 @@ class AgentApiTests(unittest.TestCase):
             get_agent_run(run["id"], self.session, "tenant-a")["status"],
             "completed",
         )
+
+    def test_api_key_and_monthly_budget_protect_queue_admission(self) -> None:
+        with patch.dict(os.environ, {"OPENAI_API_KEY": ""}):
+            with self.assertRaises(HTTPException) as missing_key:
+                create_agent_run(
+                    AgentRunRequest(goal="must not enqueue"),
+                    self.session,
+                    "tenant-a",
+                )
+        self.assertEqual(missing_key.exception.status_code, 503)
+
+        with patch.dict(
+            os.environ,
+            {
+                "MAX_MONTHLY_TOKENS_PER_TENANT": "800",
+                "MAX_OUTPUT_TOKENS": "800",
+            },
+        ):
+            with self.assertRaises(HTTPException) as budget:
+                create_agent_run(
+                    AgentRunRequest(goal="budget limit"),
+                    self.session,
+                    "tenant-a",
+                )
+        self.assertEqual(budget.exception.status_code, 429)
+
+    def test_existing_database_schema_gets_additive_token_columns(self) -> None:
+        legacy_engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        with legacy_engine.begin() as connection:
+            connection.exec_driver_sql(
+                "CREATE TABLE agent_runs (id VARCHAR(36) PRIMARY KEY, "
+                "tenant_id VARCHAR(200) NOT NULL, goal TEXT NOT NULL, "
+                "status VARCHAR(32) NOT NULL, result TEXT NOT NULL, "
+                "steps JSON NOT NULL, created_at TIMESTAMP NOT NULL)"
+            )
+            connection.exec_driver_sql(
+                "CREATE TABLE usage_records (id VARCHAR(36) PRIMARY KEY, "
+                "tenant_id VARCHAR(200) NOT NULL, run_id VARCHAR(36) NOT NULL, "
+                "agent VARCHAR(80) NOT NULL, feature VARCHAR(80) NOT NULL, "
+                "cpu_milliseconds INTEGER NOT NULL, memory_bytes INTEGER NOT NULL, "
+                "billable_cents INTEGER NOT NULL, operating_cost_cents INTEGER NOT NULL, "
+                "created_at TIMESTAMP NOT NULL)"
+            )
+        with patch("database.session.get_engine", return_value=legacy_engine):
+            initialize_database()
+
+        run_columns = {
+            column["name"] for column in inspect(legacy_engine).get_columns("agent_runs")
+        }
+        usage_columns = {
+            column["name"]
+            for column in inspect(legacy_engine).get_columns("usage_records")
+        }
+        self.assertIn("approval_required", run_columns)
+        self.assertIn("processing_started_at", run_columns)
+        self.assertIn("input_tokens", usage_columns)
+        self.assertIn("sell_price_micro_usd", usage_columns)
+        legacy_engine.dispose()
 
     def test_stuck_run_expires_without_provider_retry(self) -> None:
         queued = create_queued_run(self.session, "tenant-a", "stuck worker")

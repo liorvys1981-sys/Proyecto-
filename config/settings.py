@@ -53,15 +53,15 @@ def openai_api_key() -> str | None:
 
 
 def max_output_tokens() -> int:
-    return _positive_setting("MAX_OUTPUT_TOKENS", 800)
+    return _positive_limit("MAX_OUTPUT_TOKENS", 800)
 
 
 def max_monthly_tokens_per_tenant() -> int:
-    return _positive_setting("MAX_MONTHLY_TOKENS_PER_TENANT", 1_000_000)
+    return _positive_limit("MAX_MONTHLY_TOKENS_PER_TENANT", 1_000_000)
 
 
 def max_queued_runs_per_tenant() -> int:
-    return _positive_setting("MAX_QUEUED_RUNS_PER_TENANT", 10)
+    return _positive_limit("MAX_QUEUED_RUNS_PER_TENANT", 10)
 
 
 def openai_input_cost_micro_usd_per_million() -> int:
@@ -112,6 +112,16 @@ def validate_token_pricing() -> None:
     openai_input_cost_micro_usd_per_million()
     openai_output_cost_micro_usd_per_million()
     token_price_tiers()
+    max_output_tokens()
+    max_monthly_tokens_per_tenant()
+    max_queued_runs_per_tenant()
+
+
+def _positive_limit(name: str, default: int) -> int:
+    value = _positive_setting(name, default)
+    if value == 0:
+        raise RuntimeError(f"{name} must be greater than zero")
+    return value
 
 
 def _positive_setting(name: str, default: int) -> int:
