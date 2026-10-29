@@ -45,10 +45,16 @@ def build_executive_report(session: Session) -> dict:
     components = agent_health(session)
     run_counts = dict(
         session.execute(
-            select(AgentRunRecord.status, func.count()).group_by(
-                AgentRunRecord.status
-            )
+            select(AgentRunRecord.status, func.count()).group_by(AgentRunRecord.status)
         ).all()
+    )
+    tenant_active_counts = session.execute(
+        select(AgentRunRecord.tenant_id, func.count())
+        .where(AgentRunRecord.status.in_(("queued", "processing")))
+        .group_by(AgentRunRecord.tenant_id)
+    ).all()
+    tenants_over_capacity = sum(
+        count > max_queued_runs_per_tenant() for _, count in tenant_active_counts
     )
     usage = session.execute(
         select(
@@ -77,12 +83,12 @@ def build_executive_report(session: Session) -> dict:
                 "evidence": unhealthy_components,
             }
         )
-    if queue["queued"] > max_queued_runs_per_tenant():
+    if tenants_over_capacity:
         recommendations.append(
             {
                 "priority": "medium",
-                "action": "Review worker capacity and tenant queue limits.",
-                "evidence": {"queued_runs": queue["queued"]},
+                "action": "Review tenant queue limits and worker capacity.",
+                "evidence": {"tenants_over_configured_limit": tenants_over_capacity},
             }
         )
     if queue["failed"]:
@@ -105,6 +111,7 @@ def build_executive_report(session: Session) -> dict:
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "status": "degraded" if unhealthy_components else "healthy",
         "decision_mode": "read_only_advisory",
+        "task_routing": "one GPT-4o completion per queued run; no specialist tool calls",
         "runtime_components": components,
         "specialist_modules": list(SPECIALIST_MODULES),
         "queue": queue,
@@ -115,7 +122,7 @@ def build_executive_report(session: Session) -> dict:
             "total_tokens": usage[1] + usage[2],
             "estimated_provider_cost_micro_usd": usage[3],
             "estimated_sell_price_micro_usd": usage[4],
-            "paid_revenue_verified": False,
+            "revenue_source": "estimated_usage; payment reconciliation is separate",
         },
         "recommendations": recommendations[:3],
         "automated_actions_taken": [],

@@ -98,6 +98,9 @@ class AgentApiTests(unittest.TestCase):
         self.assertGreaterEqual(preview["billable_cents"], 50)
         self.assertEqual(self.fake_client.completions.request["model"], "gpt-4o")
         self.assertNotIn("tools", self.fake_client.completions.request)
+        system_prompt = self.fake_client.completions.request["messages"][0]["content"]
+        self.assertIn("task orchestrator", system_prompt)
+        self.assertIn("do not claim to have called", system_prompt)
         self.assertIsNotNone(run["finished_at"])
         self.assertIsNotNone(run["execution_duration_ms"])
         self.assertGreaterEqual(run["execution_duration_ms"], 0)
@@ -452,9 +455,10 @@ class AgentApiTests(unittest.TestCase):
         report = orchestrator_report(self.session)
 
         self.assertEqual(report["decision_mode"], "read_only_advisory")
+        self.assertIn("one GPT-4o completion", report["task_routing"])
         self.assertEqual(report["queue"]["queued"], 1)
         self.assertEqual(report["usage"]["events"], 0)
-        self.assertFalse(report["usage"]["paid_revenue_verified"])
+        self.assertIn("payment reconciliation", report["usage"]["revenue_source"])
         self.assertEqual(report["automated_actions_taken"], [])
         self.assertIn(
             "Run a controlled test task to establish a usage baseline.",
