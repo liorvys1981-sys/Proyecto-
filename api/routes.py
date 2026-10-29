@@ -35,6 +35,7 @@ from database.models import (
     AgentDecisionRecord,
     AgentMessageRecord,
     AgentRunRecord,
+    AgentSubtaskRecord,
     BillingInvoice,
     ProcessedWebhook,
     UsageRecord,
@@ -420,6 +421,44 @@ def get_agent_run_decisions(
                 "status": item.status,
                 "evidence": item.evidence,
                 "created_at": item.created_at,
+            }
+
+
+@router.get("/v1/agent-runs/{run_id}/subtasks")
+def get_agent_run_subtasks(
+            run_id: str, session: SessionDependency, tenant_id: TenantDependency
+) -> dict:
+            run = session.scalar(
+                select(AgentRunRecord.id).where(
+                    AgentRunRecord.id == run_id, AgentRunRecord.tenant_id == tenant_id
+                )
+            )
+            if run is None:
+                raise HTTPException(status_code=404, detail="Run not found")
+            subtasks = session.scalars(
+                select(AgentSubtaskRecord)
+                .where(
+                    AgentSubtaskRecord.run_id == run_id,
+                    AgentSubtaskRecord.tenant_id == tenant_id,
+                )
+                .order_by(AgentSubtaskRecord.created_at, AgentSubtaskRecord.task_key)
+            ).all()
+            return {
+                "run_id": run_id,
+                "subtasks": [
+                    {
+                        "task_key": item.task_key,
+                        "agent": item.agent,
+                        "depends_on": item.depends_on,
+                        "status": item.status,
+                        "attempts": item.attempts,
+                        "result": item.result,
+                        "created_at": item.created_at,
+                        "started_at": item.started_at,
+                        "finished_at": item.finished_at,
+                    }
+                    for item in subtasks
+                ],
             }
             for item in decisions
         ],

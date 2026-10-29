@@ -113,7 +113,10 @@ def claim_next_message(session: Session) -> AgentMessageRecord | None:
         session.rollback()
         return None
     session.commit()
-    return session.get(AgentMessageRecord, candidate_id)
+    message = session.get(AgentMessageRecord, candidate_id)
+    if message is not None:
+        session.refresh(message)
+    return message
 
 
 def _consume_decision(session: Session, message: AgentMessageRecord) -> None:

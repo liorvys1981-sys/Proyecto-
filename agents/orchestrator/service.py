@@ -13,7 +13,12 @@ from agents.orchestrator.planning import plan_run
 from agents.resources.service import measure_async, resource_decision
 from agents.security.service import assess_request
 from core.llm.gpt4o import generate
-from database.models import AgentDecisionRecord, AgentRunRecord, UsageRecord
+from database.models import (
+    AgentDecisionRecord,
+    AgentRunRecord,
+    AgentSubtaskRecord,
+    UsageRecord,
+)
 from monitoring.health import diagnose_runtime, heartbeat
 
 
@@ -33,6 +38,35 @@ def _record_decisions(
         )
         session.add(record)
         publish_decision(session, record)
+
+
+def _update_subtask(
+    session: Session,
+    run_id: str,
+    task_key: str,
+    status: str,
+    result: dict[str, Any] | None = None,
+    commit: bool = True,
+) -> None:
+    subtask = session.scalar(
+        select(AgentSubtaskRecord).where(
+            AgentSubtaskRecord.run_id == run_id,
+            AgentSubtaskRecord.task_key == task_key,
+        )
+    )
+    if subtask is None:
+        return
+    now = datetime.now(timezone.utc)
+    if status == "running":
+        subtask.attempts += 1
+        subtask.started_at = now
+    if status in ("completed", "failed"):
+        subtask.finished_at = now
+    subtask.status = status
+    if result is not None:
+        subtask.result = result
+    if commit:
+        session.commit()
 
 
 def create_queued_run(
@@ -95,28 +129,79 @@ async def run_workflow(
     session: Session, run: AgentRunRecord, client: Any
 ) -> AgentRunRecord:
     decisions: list[AgentDecision] = []
+    active_subtask: str | None = None
     try:
         plan = plan_run(run.goal, run.approval_required)
+        decisions.append(plan)
+        for step in plan.evidence["steps"]:
+            session.add(
+                AgentSubtaskRecord(
+                    id=str(uuid4()),
+                    tenant_id=run.tenant_id,
+                    run_id=run.id,
+                    task_key=step["key"],
+                    agent=step["agent"],
+                    depends_on=step["depends_on"],
+                    status="planned",
+                    attempts=0,
+                    result={},
+                    created_at=datetime.now(timezone.utc),
+                )
+            )
+        session.commit()
+
+        active_subtask = "security_policy"
+        _update_subtask(session, run.id, active_subtask, "running")
         security = assess_request(run.goal, run.approval_required)
-        diagnostics = diagnose_runtime(session)
-        decisions.extend(
-            [
-                plan,
-                security,
-                AgentDecision(
-                    agent="devops",
-                    status=(
-                        "warning"
-                        if diagnostics["stale_processing_runs"]
-                        else "diagnosed"
-                    ),
-                    evidence=diagnostics,
-                ),
-            ]
+        decisions.append(security)
+        _update_subtask(
+            session,
+            run.id,
+            active_subtask,
+            "completed",
+            security.evidence,
         )
+
+        active_subtask = "runtime_diagnostics"
+        _update_subtask(session, run.id, active_subtask, "running")
+        diagnostics = diagnose_runtime(session)
+        devops = AgentDecision(
+            agent="devops",
+            status="warning" if diagnostics["stale_processing_runs"] else "diagnosed",
+            evidence=diagnostics,
+        )
+        decisions.append(devops)
+        _update_subtask(
+            session, run.id, active_subtask, "completed", diagnostics
+        )
+
+        active_subtask = "gpt4o_completion"
+        _update_subtask(session, run.id, active_subtask, "running")
         (answer, input_tokens, output_tokens), cpu_milliseconds, memory_bytes = (
             await measure_async(generate, client, run.goal)
         )
+        _update_subtask(
+            session,
+            run.id,
+            active_subtask,
+            "completed",
+            {"input_tokens": input_tokens, "output_tokens": output_tokens},
+        )
+
+        active_subtask = "resources_measurement"
+        _update_subtask(session, run.id, active_subtask, "running")
+        resources = resource_decision(cpu_milliseconds, memory_bytes)
+        decisions.append(resources)
+        _update_subtask(
+            session,
+            run.id,
+            active_subtask,
+            "completed",
+            resources.evidence,
+        )
+
+        active_subtask = "token_pricing"
+        _update_subtask(session, run.id, active_subtask, "running")
         month_start = datetime.now(timezone.utc).replace(
             day=1, hour=0, minute=0, second=0, microsecond=0
         )
@@ -133,9 +218,25 @@ async def run_workflow(
         monetization, quote = assess_run_cost(
             input_tokens, output_tokens, monthly_tokens or 0
         )
-        resources = resource_decision(cpu_milliseconds, memory_bytes)
+        decisions.append(monetization)
+        _update_subtask(
+            session,
+            run.id,
+            active_subtask,
+            "completed",
+            monetization.evidence,
+        )
+
+        active_subtask = "result_analytics"
+        _update_subtask(session, run.id, active_subtask, "running")
         analytics = analyze_completion(answer, input_tokens, output_tokens)
-        decisions.extend([resources, monetization, analytics])
+        decisions.append(analytics)
+        _update_subtask(
+            session, run.id, active_subtask, "completed", analytics.evidence
+        )
+
+        active_subtask = "persist_audit_and_usage"
+        _update_subtask(session, run.id, active_subtask, "running")
         now = datetime.now(timezone.utc)
         approval_required = (
             run.approval_required or security.status == "review_required"
@@ -160,6 +261,14 @@ async def run_workflow(
                     "detail": "High-impact requests require review; no external tools are enabled.",
                 }
             )
+        _update_subtask(
+            session,
+            run.id,
+            active_subtask,
+            "completed",
+            {"decision_count": len(decisions), "usage_recorded": True},
+            commit=False,
+        )
         _record_decisions(session, run, decisions)
         session.add(
             UsageRecord(
@@ -191,6 +300,17 @@ async def run_workflow(
         heartbeat(session, "gpt4o", "healthy")
         heartbeat(session, "orchestrator", "healthy")
     except Exception as error:
+        session.rollback()
+        run = session.get(AgentRunRecord, run.id)
+        if active_subtask:
+            _update_subtask(
+                session,
+                run.id,
+                active_subtask,
+                "failed",
+                {"error_type": type(error).__name__},
+                commit=False,
+            )
         run.status = "failed"
         run.finished_at = datetime.now(timezone.utc)
         run.result = "The GPT-4o request failed; no automatic retry was made."
@@ -243,6 +363,15 @@ def expire_stuck_runs(session: Session, older_than_seconds: int = 180) -> int:
                 "Worker stopped during processing; automatic retry disabled to avoid "
                 "duplicate provider charges."
             )
+            for subtask in session.scalars(
+                select(AgentSubtaskRecord).where(
+                    AgentSubtaskRecord.run_id == run.id,
+                    AgentSubtaskRecord.status.in_(("planned", "running")),
+                )
+            ):
+                subtask.status = "failed"
+                subtask.result = {"error": "worker_lease_expired"}
+                subtask.finished_at = datetime.now(timezone.utc)
             expired += 1
     if expired:
         session.commit()

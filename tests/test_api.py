@@ -33,6 +33,7 @@ from api.routes import (
     create_checkout,
     get_agent_run,
     get_agent_run_decisions,
+    get_agent_run_subtasks,
     orchestrator_report,
     prometheus_metrics,
     require_admin,
@@ -129,6 +130,16 @@ class AgentApiTests(unittest.TestCase):
         )
         self.assertTrue(all(item["contract_version"] == 1 for item in decisions))
         self.assertGreaterEqual(run["usage"][0]["memory_bytes"], 0)
+        subtasks = get_agent_run_subtasks(run["id"], self.session, "tenant-a")[
+            "subtasks"
+        ]
+        self.assertEqual(len(subtasks), 7)
+        self.assertTrue(all(item["status"] == "completed" for item in subtasks))
+        provider_task = next(
+            item for item in subtasks if item["task_key"] == "gpt4o_completion"
+        )
+        self.assertEqual(provider_task["result"]["input_tokens"], 100_000)
+        self.assertEqual(provider_task["attempts"], 1)
         outbox = self.session.scalars(
             select(AgentMessageRecord).where(AgentMessageRecord.run_id == run["id"])
         ).all()
@@ -170,6 +181,9 @@ class AgentApiTests(unittest.TestCase):
         with self.assertRaises(HTTPException) as decision_error:
             get_agent_run_decisions(run["id"], self.session, "tenant-b")
         self.assertEqual(decision_error.exception.status_code, 404)
+        with self.assertRaises(HTTPException) as subtask_error:
+            get_agent_run_subtasks(run["id"], self.session, "tenant-b")
+        self.assertEqual(subtask_error.exception.status_code, 404)
 
     def test_security_agent_holds_high_impact_request_for_approval(self) -> None:
         run = create_agent_run(
@@ -598,6 +612,14 @@ class AgentApiTests(unittest.TestCase):
         self.assertEqual(failed["status"], "failed")
         self.assertEqual(self.fake_client.completions.call_count, 1)
         self.assertEqual(billing_preview(self.session, "tenant-a")["total_tokens"], 0)
+        subtasks = get_agent_run_subtasks(run["id"], self.session, "tenant-a")[
+            "subtasks"
+        ]
+        provider_task = next(
+            item for item in subtasks if item["task_key"] == "gpt4o_completion"
+        )
+        self.assertEqual(provider_task["status"], "failed")
+        self.assertEqual(provider_task["attempts"], 1)
 
     def test_admin_metrics_count_provider_tokens(self) -> None:
         self.enqueue_and_process("metrics test")

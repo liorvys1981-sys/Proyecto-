@@ -186,3 +186,35 @@ class AgentCoordinationRecord(Base):
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     participating_agents: Mapped[list[str]] = mapped_column(JSON, nullable=False)
     verified_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class AgentSubtaskRecord(Base):
+    __tablename__ = "agent_subtasks"
+    __table_args__ = (
+        Index(
+            "uq_agent_subtasks_run_key",
+            "run_id",
+            "task_key",
+            unique=True,
+        ),
+        Index("ix_agent_subtasks_tenant_status", "tenant_id", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("agent_runs.id"), nullable=False, index=True
+    )
+    task_key: Mapped[str] = mapped_column(String(100), nullable=False)
+    agent: Mapped[str] = mapped_column(String(80), nullable=False)
+    depends_on: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    result: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
