@@ -46,6 +46,7 @@ from database.models import (
     AgentDecisionRecord,
     AgentMessageRecord,
     AgentRunRecord,
+    AgentSubtaskRecord,
     Base,
     BillingInvoice,
 )
@@ -135,11 +136,28 @@ class AgentApiTests(unittest.TestCase):
         ]
         self.assertEqual(len(subtasks), 7)
         self.assertTrue(all(item["status"] == "completed" for item in subtasks))
+        completed_keys = {
+            item["task_key"] for item in subtasks if item["status"] == "completed"
+        }
+        self.assertTrue(
+            all(set(item["depends_on"]) <= completed_keys for item in subtasks)
+        )
         provider_task = next(
             item for item in subtasks if item["task_key"] == "gpt4o_completion"
         )
         self.assertEqual(provider_task["result"]["input_tokens"], 100_000)
         self.assertEqual(provider_task["attempts"], 1)
+        reopened_session = get_session_factory()()
+        try:
+            persisted_subtasks = get_agent_run_subtasks(
+                run["id"], reopened_session, "tenant-a"
+            )["subtasks"]
+        finally:
+            reopened_session.close()
+        self.assertEqual(len(persisted_subtasks), 7)
+        self.assertTrue(
+            all(item["status"] == "completed" for item in persisted_subtasks)
+        )
         outbox = self.session.scalars(
             select(AgentMessageRecord).where(AgentMessageRecord.run_id == run["id"])
         ).all()
@@ -577,6 +595,7 @@ class AgentApiTests(unittest.TestCase):
         self.assertIn("finished_at", run_columns)
         self.assertIn("idempotency_key", run_columns)
         self.assertIn("request_hash", run_columns)
+        self.assertIn("agent_subtasks", inspect(legacy_engine).get_table_names())
         run_indexes = {
             index["name"] for index in inspect(legacy_engine).get_indexes("agent_runs")
         }
@@ -592,11 +611,46 @@ class AgentApiTests(unittest.TestCase):
         queued.processing_started_at = datetime.now(timezone.utc) - timedelta(
             seconds=300
         )
+        self.session.add_all(
+            [
+                AgentSubtaskRecord(
+                    id="expired-running-subtask",
+                    tenant_id="tenant-a",
+                    run_id=queued.id,
+                    task_key="running",
+                    agent="orchestrator",
+                    depends_on=[],
+                    status="running",
+                    attempts=1,
+                    result={},
+                    created_at=datetime.now(timezone.utc) - timedelta(seconds=300),
+                ),
+                AgentSubtaskRecord(
+                    id="expired-planned-subtask",
+                    tenant_id="tenant-a",
+                    run_id=queued.id,
+                    task_key="planned",
+                    agent="analytics",
+                    depends_on=["running"],
+                    status="planned",
+                    attempts=0,
+                    result={},
+                    created_at=datetime.now(timezone.utc) - timedelta(seconds=300),
+                ),
+            ]
+        )
         self.session.commit()
 
         self.assertEqual(expire_stuck_runs(self.session), 1)
         self.assertEqual(
             get_agent_run(queued.id, self.session, "tenant-a")["status"], "failed"
+        )
+        subtasks = get_agent_run_subtasks(
+            queued.id, self.session, "tenant-a"
+        )["subtasks"]
+        self.assertTrue(all(item["status"] == "failed" for item in subtasks))
+        self.assertTrue(
+            all(item["result"]["error"] == "worker_lease_expired" for item in subtasks)
         )
 
     def test_provider_failure_is_not_retried_or_charged(self) -> None:
@@ -620,6 +674,7 @@ class AgentApiTests(unittest.TestCase):
         )
         self.assertEqual(provider_task["status"], "failed")
         self.assertEqual(provider_task["attempts"], 1)
+        self.assertTrue(all(item["status"] != "planned" for item in subtasks))
 
     def test_admin_metrics_count_provider_tokens(self) -> None:
         self.enqueue_and_process("metrics test")

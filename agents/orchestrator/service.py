@@ -56,6 +56,18 @@ def _update_subtask(
     )
     if subtask is None:
         return
+    if status == "running" and subtask.depends_on:
+        completed_dependencies = set(
+            session.scalars(
+                select(AgentSubtaskRecord.task_key).where(
+                    AgentSubtaskRecord.run_id == run_id,
+                    AgentSubtaskRecord.task_key.in_(subtask.depends_on),
+                    AgentSubtaskRecord.status == "completed",
+                )
+            ).all()
+        )
+        if completed_dependencies != set(subtask.depends_on):
+            raise RuntimeError("Subtask dependencies are not complete")
     now = datetime.now(timezone.utc)
     if status == "running":
         subtask.attempts += 1
@@ -311,6 +323,18 @@ async def run_workflow(
                 {"error_type": type(error).__name__},
                 commit=False,
             )
+        for pending_subtask in session.scalars(
+            select(AgentSubtaskRecord).where(
+                AgentSubtaskRecord.run_id == run.id,
+                AgentSubtaskRecord.status == "planned",
+            )
+        ):
+            pending_subtask.status = "failed"
+            pending_subtask.result = {
+                "error": "prerequisite_failed",
+                "failed_task": active_subtask,
+            }
+            pending_subtask.finished_at = datetime.now(timezone.utc)
         run.status = "failed"
         run.finished_at = datetime.now(timezone.utc)
         run.result = "The GPT-4o request failed; no automatic retry was made."
