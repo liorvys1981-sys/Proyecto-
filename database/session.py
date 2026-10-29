@@ -27,22 +27,30 @@ def get_session_factory():
 
 def initialize_database() -> None:
     engine = get_engine()
-    Base.metadata.create_all(engine)
-    columns = {
-        column["name"] for column in inspect(engine).get_columns("usage_records")
-    }
-    new_columns = {
-        "input_tokens": "INTEGER NOT NULL DEFAULT 0",
-        "output_tokens": "INTEGER NOT NULL DEFAULT 0",
-        "provider_cost_micro_usd": "INTEGER NOT NULL DEFAULT 0",
-        "input_provider_cost_micro_usd": "INTEGER NOT NULL DEFAULT 0",
-        "output_provider_cost_micro_usd": "INTEGER NOT NULL DEFAULT 0",
-        "input_sell_price_micro_usd": "INTEGER NOT NULL DEFAULT 0",
-        "output_sell_price_micro_usd": "INTEGER NOT NULL DEFAULT 0",
-        "sell_price_micro_usd": "INTEGER NOT NULL DEFAULT 0",
-        "markup_bps": "INTEGER NOT NULL DEFAULT 0",
-    }
     with engine.begin() as connection:
+        if connection.dialect.name == "postgresql":
+            connection.execute(
+                text(
+                    "SELECT pg_advisory_xact_lock("
+                    "hashtextextended('yimi_schema_initialization', 0))"
+                )
+            )
+        Base.metadata.create_all(connection)
+        columns = {
+            column["name"]
+            for column in inspect(connection).get_columns("usage_records")
+        }
+        new_columns = {
+            "input_tokens": "INTEGER NOT NULL DEFAULT 0",
+            "output_tokens": "INTEGER NOT NULL DEFAULT 0",
+            "provider_cost_micro_usd": "INTEGER NOT NULL DEFAULT 0",
+            "input_provider_cost_micro_usd": "INTEGER NOT NULL DEFAULT 0",
+            "output_provider_cost_micro_usd": "INTEGER NOT NULL DEFAULT 0",
+            "input_sell_price_micro_usd": "INTEGER NOT NULL DEFAULT 0",
+            "output_sell_price_micro_usd": "INTEGER NOT NULL DEFAULT 0",
+            "sell_price_micro_usd": "INTEGER NOT NULL DEFAULT 0",
+            "markup_bps": "INTEGER NOT NULL DEFAULT 0",
+        }
         for column_name, definition in new_columns.items():
             if column_name not in columns:
                 connection.execute(
