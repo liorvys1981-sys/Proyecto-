@@ -81,7 +81,9 @@ Los cálculos de costo y margen se basan en tarifas configuradas, no en la factu
 
 Los prompts se envían a OpenAI para generar respuestas. No se envían herramientas ni permisos para realizar compras, trading, despliegues u operaciones externas. Un fallo del proveedor marca la tarea como `failed` sin reintento automático.
 
-`GET /health` prueba la base de datos. `/v1/admin/health` informa heartbeats obsoletos después de 120 segundos; `/v1/admin/metrics` muestra tokens y costos estimados. `monitoring/prometheus.yml` es una plantilla de scrape; configura `/etc/prometheus/secrets/admin-key` con una credencial protegida.
+`GET /health` prueba la base de datos. `/v1/admin/health` informa heartbeats obsoletos después de 120 segundos; `/v1/admin/metrics` muestra tokens y costos estimados. Compose incluye Prometheus con retención persistente de 15 días y reglas para réplicas API caídas, heartbeats obsoletos y acumulación de la cola. Las métricas exponen también el total de tareas en espera y en proceso.
+
+Antes de arrancar Compose, crea `monitoring/secrets/admin-key` con el mismo valor que `ADMIN_API_KEY` y limita sus permisos al usuario que ejecuta Docker. No lo guardes en Git ni lo publiques. Prometheus no expone un puerto al host; las reglas disparan alertas visibles en su interfaz interna, pero **no envían notificaciones externas** hasta integrar y configurar un receptor de Alertmanager. Las métricas son agregados de la base de datos compartida, no una prueba independiente de disponibilidad del host.
 
 ## Pruebas
 

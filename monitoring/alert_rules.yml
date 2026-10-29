@@ -1,0 +1,29 @@
+groups:
+  - name: yimi-availability
+    rules:
+      - alert: YimiApiReplicaUnavailable
+        expr: up{job="yimi-api"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: A YIMI API replica is unavailable
+          description: "Prometheus cannot scrape {{ $labels.instance }} for at least 2 minutes."
+
+      - alert: YimiAgentHeartbeatStale
+        expr: yimi_agent_healthy == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: A YIMI agent heartbeat is stale or unhealthy
+          description: "Agent {{ $labels.agent }} has not reported a healthy heartbeat."
+
+      - alert: YimiQueueBacklog
+        expr: max(yimi_queued_runs) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: YIMI's task queue is backing up
+          description: "More than 5 tasks have been queued for at least 5 minutes."

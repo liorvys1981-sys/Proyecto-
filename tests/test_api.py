@@ -31,6 +31,7 @@ from api.routes import (
     create_agent_run,
     create_checkout,
     get_agent_run,
+    prometheus_metrics,
     require_admin,
     resolve_tenant,
     stripe_webhook,
@@ -388,6 +389,15 @@ class AgentApiTests(unittest.TestCase):
         self.assertEqual(metrics["total_tokens"], 150_000)
         self.assertEqual(metrics["input_tokens"], 100_000)
         self.assertEqual(metrics["output_tokens"], 50_000)
+
+    def test_prometheus_metrics_include_queue_and_agent_health(self) -> None:
+        create_queued_run(self.session, "tenant-a", "pending task")
+
+        metrics = prometheus_metrics(self.session)
+
+        self.assertIn("yimi_queued_runs 1", metrics)
+        self.assertIn("yimi_processing_runs 0", metrics)
+        self.assertIn('yimi_agent_healthy{agent="gpt4o"} 0', metrics)
 
     def test_tier_configuration_is_monotonic_and_threshold_based(self) -> None:
         self.assertEqual(token_price_tiers()[0]["monthly_tokens"], 0)

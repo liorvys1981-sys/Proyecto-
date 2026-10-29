@@ -548,6 +548,12 @@ def admin_metrics(session: SessionDependency) -> dict:
 )
 def prometheus_metrics(session: SessionDependency) -> str:
     metrics = admin_metrics(session)
+    run_counts = dict(
+        session.execute(
+            select(AgentRunRecord.status, func.count()).group_by(AgentRunRecord.status)
+        ).all()
+    )
+    agents = agent_health(session)
     return "\n".join(
         [
             "# HELP yimi_usage_events_total Recorded agent usage events.",
@@ -565,6 +571,19 @@ def prometheus_metrics(session: SessionDependency) -> str:
             "# HELP yimi_usage_revenue_cents_estimated Usage revenue before payment.",
             "# TYPE yimi_usage_revenue_cents_estimated gauge",
             f"yimi_usage_revenue_cents_estimated {metrics['estimated_billable_cents']}",
+            "# HELP yimi_queued_runs Number of runs waiting for a worker.",
+            "# TYPE yimi_queued_runs gauge",
+            f"yimi_queued_runs {run_counts.get('queued', 0)}",
+            "# HELP yimi_processing_runs Number of runs currently being processed.",
+            "# TYPE yimi_processing_runs gauge",
+            f"yimi_processing_runs {run_counts.get('processing', 0)}",
+            "# HELP yimi_agent_healthy Whether the agent heartbeat is current and healthy.",
+            "# TYPE yimi_agent_healthy gauge",
+            *[
+                f'yimi_agent_healthy{{agent="{agent["agent"]}"}} '
+                f'{int(agent["status"] == "healthy")}'
+                for agent in agents
+            ],
             "",
         ]
     )

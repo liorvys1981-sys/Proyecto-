@@ -57,5 +57,26 @@ services:
     cpus: 0.25
     mem_limit: 128m
 
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+    volumes:
+      - ../monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../monitoring/alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
+      - ../monitoring/secrets/admin-key:/etc/prometheus/secrets/admin-key:ro
+      - yimi-prometheus:/prometheus
+    depends_on:
+      api-1:
+        condition: service_healthy
+      api-2:
+        condition: service_healthy
+    restart: unless-stopped
+    cpus: 0.5
+    mem_limit: 512m
+
 volumes:
   yimi-postgres:
+  yimi-prometheus:
