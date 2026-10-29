@@ -12,6 +12,7 @@ La organización toma como referencia conceptual la estructura de [ECO.IA](https
 - `POST /v1/billing/checkout` cobra mediante Stripe solo tras consentimiento explícito y confirmación del importe exacto mostrado. El cliente confirma el pago en Stripe; nunca hay un cargo silencioso.
 - `/v1/billing/webhook` verifica firma, factura, tenant, sesión, importe, moneda y estado de pago; evita procesar el mismo evento más de una vez.
 - Endpoints administrativos muestran salud de worker, cola, tasa de éxito y p95 de duración de ejecución sobre hasta las últimas 5.000 ejecuciones exitosas; requieren `X-Admin-Key`. Prometheus lee su credencial de un archivo protegido configurado en `monitoring/prometheus.yml`.
+- `GET /v1/admin/orchestrator/report` ofrece un resumen ejecutivo de salud, cola, consumo estimado y recomendaciones basadas en evidencia local. Es de solo lectura y no hace llamadas GPT adicionales, cambios de infraestructura ni acciones de pago.
 - Las operaciones que pidan aprobación quedan en espera. La aprobación es informativa: el agente no dispone de herramientas para ejecutar acciones reales.
 
 ## Arranque local
@@ -88,6 +89,8 @@ Los prompts se envían a OpenAI para generar respuestas. No se envían herramien
 `scripts/start.sh` crea `monitoring/secrets/admin-key` con permisos restrictivos a partir de `ADMIN_API_KEY`. Usa para esa variable un valor aleatorio sin comillas ni espacios, igual que en `.env`; nunca guardes el archivo generado en Git. Prometheus no expone un puerto al host; las reglas disparan alertas visibles en su interfaz interna, pero **no envían notificaciones externas** hasta integrar y configurar un receptor de Alertmanager. Las métricas son agregados de la base de datos compartida, no una prueba independiente de disponibilidad del host.
 
 Los scripts `scripts/setup.sh` y `scripts/start.sh` preparan directorios y arranque local; `scripts/backup.sh` genera un dump PostgreSQL en `backups/`. Un dump creado no demuestra que sea recuperable: prueba la restauración en una base aislada antes de depender de él. El catálogo `config/agents_config.yaml` distingue módulos existentes de agentes autónomos completos; sirve como inventario y no habilita capacidades runtime.
+
+El informe del orquestador etiqueta con precisión los módulos especialistas como locales, observabilidad o guardrails; no afirma que sean workers autónomos separados. Los planes se presentan como recomendaciones, no se ejecutan. Los costos y precios son estimaciones registradas; el reporte no verifica pagos recibidos ni rentabilidad neta.
 
 ## Pruebas
 

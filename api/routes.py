@@ -16,6 +16,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from agents.monetization.token_pricing import MICRO_USD_PER_CENT, ceil_div
+from agents.orchestrator.report import build_executive_report
 from agents.orchestrator.service import create_queued_run
 from config.settings import (
     openai_api_key,
@@ -720,3 +721,10 @@ def prometheus_metrics(session: SessionDependency) -> str:
 @router.get("/v1/admin/agents", dependencies=[Depends(require_admin)])
 def admin_agents(session: SessionDependency) -> dict:
     return {"agents": agent_health(session)}
+
+
+@router.get(
+    "/v1/admin/orchestrator/report", dependencies=[Depends(require_admin)]
+)
+def orchestrator_report(session: SessionDependency) -> dict:
+    return build_executive_report(session)

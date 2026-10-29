@@ -7,11 +7,11 @@ agents:
   - id: master_orchestrator
     module: agents.orchestrator.service
     status: implemented
-    scope: Durable task queue, single-run claiming, and GPT-4o dispatch.
+    scope: Durable task queue and GPT-4o dispatch; executive report is read-only and advisory.
   - id: monetization
     module: agents.monetization.token_pricing
     status: implemented
-    scope: Token cost estimation and configurable resale tiers.
+    scope: Local token cost estimation and configurable resale tiers; not an autonomous billing worker.
   - id: devops
     module: monitoring.health
     status: partial
