@@ -65,7 +65,7 @@ async def resolve_tenant(
     if credentials is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="****** required",
+            detail="Authentication required",
             headers={"WWW-Authenticate": "Bearer"},
         )
     try:
@@ -76,7 +76,7 @@ async def resolve_tenant(
             detail="Tenant authentication is not configured",
         ) from error
     if api_key is None or not secrets.compare_digest(
-        api_key, credentials.credentials
+        api_key.encode("utf-8"), credentials.credentials.encode("utf-8")
     ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
