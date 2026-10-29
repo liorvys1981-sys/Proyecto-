@@ -28,7 +28,7 @@ La API interactiva queda disponible en `http://localhost:8000/docs`.
 
 ## Ejemplo de API
 
-Envía el identificador de tenant y su clave Bearer:
+Envía el identificador de tenant y sus credenciales:
 
 ```bash
 curl -X POST http://localhost:8000/v1/agent-runs \
@@ -38,7 +38,7 @@ curl -X POST http://localhost:8000/v1/agent-runs \
   -d '{"goal":"Analizar el rendimiento del servicio"}'
 ```
 
-`AUTH_HEADER` debe contener el esquema ****** la clave del tenant. La respuesta incluye el ID de ejecución; úsalo en `GET /v1/agent-runs/{run_id}` con las mismas credenciales.
+`AUTH_HEADER` debe contener el esquema de autorización HTTP y la clave del tenant. La respuesta incluye el ID de ejecución; úsalo en `GET /v1/agent-runs/{run_id}` con las mismas credenciales.
 
 ## Docker
 
