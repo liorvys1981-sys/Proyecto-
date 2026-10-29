@@ -7,6 +7,7 @@ from agents.analytics.service import analyze_goal
 from agents.security.service import assess_risk
 from config.settings import cost_for_feature, price_for_feature
 from database.models import AgentRunRecord, UsageRecord
+from monitoring.health import heartbeat
 
 
 def _measure(function):
@@ -18,10 +19,32 @@ def _measure(function):
     return result, cpu_milliseconds, memory_bytes
 
 
+def _run_with_recovery(session, agent: str, function):
+    for attempt in range(2):
+        try:
+            result = _measure(function)
+            heartbeat(session, agent)
+            return result
+        except Exception as error:
+            heartbeat(
+                session,
+                agent,
+                "recovering" if attempt == 0 else "unhealthy",
+                str(error)[:200],
+            )
+            if attempt == 1:
+                raise
+            time.sleep(0.05)
+
+
 def run_workflow(session, tenant_id: str, goal: str, requires_approval: bool):
     now = datetime.now(timezone.utc)
-    analysis, analysis_cpu, analysis_memory = _measure(lambda: analyze_goal(goal))
-    risk, risk_cpu, risk_memory = _measure(lambda: assess_risk(requires_approval))
+    analysis, analysis_cpu, analysis_memory = _run_with_recovery(
+        session, "analytics", lambda: analyze_goal(goal)
+    )
+    risk, risk_cpu, risk_memory = _run_with_recovery(
+        session, "security", lambda: assess_risk(requires_approval)
+    )
     steps = [
         {"agent": "analytics", "status": "completed", "detail": analysis},
         {"agent": "security", "status": risk[0], "detail": risk[1]},

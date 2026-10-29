@@ -5,6 +5,7 @@ from uuid import uuid4
 
 import stripe
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi.responses import PlainTextResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select, text
@@ -77,6 +78,20 @@ def require_admin(admin_key: Annotated[str | None, Header(alias="X-Admin-Key")] 
         raise HTTPException(status_code=401, detail="Invalid administrator credentials")
 
 
+def require_metrics(
+    credentials: Annotated[
+        HTTPAuthorizationCredentials | None, Depends(bearer_scheme)
+    ],
+) -> None:
+    configured_key = setting("ADMIN_API_KEY")
+    if not configured_key:
+        raise HTTPException(status_code=503, detail="Metrics authentication is not configured")
+    if credentials is None or not secrets.compare_digest(
+        configured_key.encode("utf-8"), credentials.credentials.encode("utf-8")
+    ):
+        raise HTTPException(status_code=401, detail="Invalid metrics credentials")
+
+
 AdminDependency = Annotated[None, Depends(require_admin)]
 
 
@@ -100,12 +115,13 @@ def _usage_summary(session: Session, tenant_id: str) -> dict:
     entries = session.scalars(
         select(UsageRecord).where(
             UsageRecord.tenant_id == tenant_id,
-            UsageRecord.created_at >= _month_start(now),
             UsageRecord.invoice_id.is_(None),
         )
     ).all()
     return {
-        "period_start": _month_start(now),
+        "period_start": min(
+            (item.created_at for item in entries), default=_month_start(now)
+        ),
         "currency": "usd",
         "billable_cents": sum(item.billable_cents for item in entries),
         "estimated_operating_cost_cents": sum(
@@ -242,6 +258,11 @@ def create_checkout(
         amount = preview["billable_cents"]
         if amount <= 0:
             raise HTTPException(status_code=409, detail="There is no billable usage")
+        if amount < 50:
+            raise HTTPException(
+                status_code=409,
+                detail="Balance is below Stripe's minimum; usage will carry forward",
+            )
         invoice = BillingInvoice(
             id=str(uuid4()),
             tenant_id=tenant_id,
@@ -255,7 +276,6 @@ def create_checkout(
         usage = session.scalars(
             select(UsageRecord).where(
                 UsageRecord.tenant_id == tenant_id,
-                UsageRecord.created_at >= preview["period_start"],
                 UsageRecord.invoice_id.is_(None),
             )
         ).all()
@@ -332,6 +352,16 @@ async def stripe_webhook(request: Request, session: SessionDependency) -> dict[s
             and invoice.currency == checkout.get("currency")
         ):
             invoice.status = "paid"
+    elif event.get("type") == "checkout.session.expired":
+        checkout = event["data"]["object"]
+        invoice_id = checkout.get("metadata", {}).get("invoice_id")
+        invoice = session.get(BillingInvoice, invoice_id) if invoice_id else None
+        if invoice and invoice.stripe_session_id == checkout.get("id"):
+            invoice.status = "checkout_expired"
+            for entry in session.scalars(
+                select(UsageRecord).where(UsageRecord.invoice_id == invoice.id)
+            ):
+                entry.invoice_id = None
     session.add(
         ProcessedWebhook(event_id=event_id, processed_at=datetime.now(timezone.utc))
     )
@@ -365,6 +395,32 @@ def admin_metrics(session: SessionDependency) -> dict:
         "estimated_billable_cents": usage[3],
         "estimated_margin_cents": usage[3] - usage[2],
     }
+
+
+@router.get(
+    "/metrics",
+    response_class=PlainTextResponse,
+    dependencies=[Depends(require_metrics)],
+)
+def prometheus_metrics(session: SessionDependency) -> str:
+    metrics = admin_metrics(session)
+    return "\n".join(
+        [
+            "# HELP yimi_usage_events_total Recorded agent usage events.",
+            "# TYPE yimi_usage_events_total counter",
+            f"yimi_usage_events_total {metrics['usage_events']}",
+            "# HELP yimi_cpu_milliseconds_total Measured agent CPU time.",
+            "# TYPE yimi_cpu_milliseconds_total counter",
+            f"yimi_cpu_milliseconds_total {metrics['cpu_milliseconds']}",
+            "# HELP yimi_operating_cost_cents_estimated Estimated operating cost.",
+            "# TYPE yimi_operating_cost_cents_estimated gauge",
+            f"yimi_operating_cost_cents_estimated {metrics['estimated_operating_cost_cents']}",
+            "# HELP yimi_usage_revenue_cents_estimated Usage revenue before payment.",
+            "# TYPE yimi_usage_revenue_cents_estimated gauge",
+            f"yimi_usage_revenue_cents_estimated {metrics['estimated_billable_cents']}",
+            "",
+        ]
+    )
 
 
 @router.get("/v1/admin/agents", dependencies=[Depends(require_admin)])

@@ -1,62 +1,76 @@
-# YIMI Platform — SaaS empresarial de agentes autónomos
+# YIMI — SaaS multi-tenant de agentes autónomos
 
-Base funcional para desarrollar una plataforma SaaS multiempresa. Incluye una API FastAPI con autenticación por tenant, un flujo de agentes simulado y una imagen Docker que se ejecuta sin privilegios de root.
+API FastAPI inspirada en la organización de alto nivel de [ECO.IA](https://github.com/lio366/ECO.IA): agentes, API, configuración, base de datos, Docker, monitoreo y pruebas. Se adaptó la estructura; no se clonó ni copió el código fuente del otro repositorio.
 
-## Alcance actual
+## Estructura
 
-- `GET /health`: comprobación básica de disponibilidad.
-- `POST /v1/agent-runs`: crea una ejecución simulada de análisis, riesgo y ejecución.
-- `GET /v1/agent-runs/{run_id}`: consulta una ejecución propia del tenant autenticado.
-- La ejecución no contacta sistemas externos ni realiza trading.
-- Las ejecuciones se guardan en memoria: se pierden al reiniciar el proceso y no se comparten entre réplicas.
+```text
+agents/       agentes de análisis, riesgo y orquestación
+api/          rutas HTTP, autenticación, cobro y aprobación
+app/          punto de entrada FastAPI y ciclo de vida supervisado
+config/       tarifas y lectura de variables de entorno
+database/     modelos y sesiones SQLAlchemy
+docker/       Compose y proxy inverso
+monitoring/   salud de agentes y configuración Prometheus
+tests/        pruebas automatizadas
+```
 
-## Ejecutar localmente
+## Funcionalidad y límites
 
-Requiere Python 3.11 o posterior.
+- `POST /v1/agent-runs`: ejecuta análisis y evaluación simulados; mide CPU y memoria del proceso por agente, y registra uso/costos por tenant en PostgreSQL.
+- `GET /v1/agent-runs/{id}`: lectura limitada al tenant autenticado.
+- `GET /v1/billing/preview`: muestra cargos pendientes, CPU, memoria observada, costos operativos estimados y margen estimado.
+- `POST /v1/billing/checkout`: crea Checkout de Stripe **solo** si hay consentimiento explícito, uso facturable y configuración de Stripe. El cliente confirma el pago en Stripe; la API no cobra silenciosamente.
+- `POST /v1/billing/webhook`: valida firma y verifica importe, moneda e ID de sesión antes de marcar una factura pagada. Los eventos repetidos son idempotentes.
+- `/v1/admin/health`, `/v1/admin/agents`, `/v1/admin/metrics` y `/metrics`: salud, alertas por heartbeat vencido y métricas globales; requieren clave administrativa.
+- `requires_approval: true` deja la acción en espera. Un administrador puede aprobar **solo la simulación**; aún no se ejecutan acciones externas.
+
+El consumo de CPU/memoria y el margen son estimaciones, no medición de energía ni garantía de beneficios. Los agentes son simulados; no existe todavía un servicio comercial de IA, trading ni ejecución de tareas externas.
+
+## Desarrollo local
+
+Requiere Python 3.12 o posterior y PostgreSQL para persistencia compartida. SQLite se usa de forma predeterminada solo para desarrollo de un proceso.
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-export TENANT_API_KEYS='{"empresa-demo":"reemplazar-con-una-clave-segura"}'
+export TENANT_API_KEYS='{"empresa-demo":"clave-local"}'
+export ADMIN_API_KEY='clave-admin-local'
 uvicorn app.main:app --reload
 ```
 
-En Windows, activa el entorno virtual con `.venv\Scripts\activate`. Para generar una clave local segura, ejecuta `python -c "import secrets; print(secrets.token_urlsafe(32))"` y configura el resultado para el tenant.
+Abre `http://localhost:8000/docs`. Genera claves con `python -c "import secrets; print(secrets.token_urlsafe(32))"`; no reutilices las claves de ejemplo.
 
-La API interactiva queda disponible en `http://localhost:8000/docs`.
-
-## Ejemplo de API
-
-Envía el identificador de tenant y sus credenciales:
+## Docker con dos API y PostgreSQL persistente
 
 ```bash
-curl -X POST http://localhost:8000/v1/agent-runs \
-  -H 'Content-Type: application/json' \
-  -H 'X-Tenant-ID: empresa-demo' \
-  -H "Authorization: $AUTH_HEADER" \
-  -d '{"goal":"Analizar el rendimiento del servicio"}'
+cp .env.example .env
+# Sustituye las claves de ejemplo; configura las credenciales de Stripe solo si quieres usar Checkout.
+docker compose --env-file .env -f docker/docker-compose.yml up --build -d
+docker compose --env-file .env -f docker/docker-compose.yml ps
 ```
 
-`AUTH_HEADER` debe contener el esquema de autorización HTTP y la clave del tenant. La respuesta incluye el ID de ejecución; úsalo en `GET /v1/agent-runs/{run_id}` con las mismas credenciales.
+El Compose inicia PostgreSQL con volumen, dos réplicas de API, Nginx y políticas `restart: unless-stopped`. El volumen sobrevive a reinicios del contenedor, pero no sustituye copias de seguridad. La base de datos es una única instancia: alta disponibilidad real requiere PostgreSQL administrado/redundante, backups probados, TLS, secretos externos y un orquestador con health checks.
 
-## Docker
+No uses las claves de `.env.example` en producción. `TENANT_API_KEYS` es un objeto JSON de ID de tenant a clave. `ADMIN_API_KEY` protege endpoints administrativos. No guardes `.env` ni secretos en el repositorio.
+
+## Tarifas y medición
+
+`PRICE_CENTS_PER_CPU_SECOND` y `COST_CENTS_PER_CPU_SECOND` son objetos JSON por función, por ejemplo `{"goal_analysis":2,"risk_assessment":2}`. Importes en centavos USD por segundo de CPU, redondeados hacia arriba al centavo. La vista previa acumula uso aún no facturado; los cargos menores al mínimo de Stripe se pueden acumular antes del Checkout.
+
+Para cobro real, configura `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_SUCCESS_URL` y `STRIPE_CANCEL_URL`; registra en Stripe el webhook `/v1/billing/webhook` para `checkout.session.completed` y `checkout.session.expired`. Prueba primero en modo de prueba de Stripe. No se guarda ningún dato de tarjeta.
+
+## Operación y monitoreo
+
+`GET /health` prueba conexión a la base. El proceso de API mantiene heartbeats; si un agente deja de reportar por más de 120 segundos, el endpoint administrativo lo marca como obsoleto. El orquestador nunca reintenta acciones externas porque todavía no las ejecuta. Los errores se registran en la respuesta del servicio, no se ocultan como éxitos.
+
+`monitoring/prometheus.yml` muestra cómo consultar `/metrics`; configura un archivo `admin-key` protegido con el mismo valor de `ADMIN_API_KEY` para la credencial ****** Prometheus. No expongas directamente métricas administrativas a Internet.
+
+`docker compose` aporta reinicios y dos procesos API, no garantiza un SLA 24/7: proxy y PostgreSQL local siguen siendo puntos únicos de fallo.
+
+## Pruebas
 
 ```bash
-docker build -t yimi-platform .
-docker run --rm -p 8000:8000 \
-  -e 'TENANT_API_KEYS={"empresa-demo":"reemplazar-con-una-clave-segura"}' \
-  yimi-platform
+python -m unittest discover -s tests -v
 ```
-
-No uses claves de ejemplo en producción ni las guardes en el repositorio, historial de shell o imágenes. Inyecta claves reales desde un gestor de secretos.
-
-## Modelo SaaS y siguientes pasos
-
-Cada tenant se autentica con una clave propia configurada en `TENANT_API_KEYS`; el servidor valida la clave contra el tenant antes de aceptar una operación. Los registros consultados se filtran por el tenant autenticado y los recursos de otros tenants responden como inexistentes.
-
-Esta base **no está lista para producción**. Antes de ofrecerla como SaaS empresarial, integra un proveedor de identidad y almacenamiento seguro de credenciales, persistencia compartida con aislamiento por tenant, gestión de secretos y rotación, límites de uso, auditoría, métricas y trazas, colas de trabajo, políticas de retención, copias de seguridad y despliegue con TLS. Sustituye el flujo simulado por agentes y herramientas con permisos explícitos, aprobaciones y controles de riesgo.
-
-## Configuración
-
-`TENANT_API_KEYS` es un objeto JSON que relaciona IDs de tenant con claves. La configuración se carga una vez por proceso; para aplicar cambios, reinicia el servicio. Las credenciales ausentes o inválidas reciben `401`; si falta la configuración de tenant, las solicitudes autenticadas reciben `503`.

@@ -10,6 +10,11 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && useradd --create-home --uid 10001 app
 
 COPY --chown=app:app app ./app
+COPY --chown=app:app api ./api
+COPY --chown=app:app agents ./agents
+COPY --chown=app:app config ./config
+COPY --chown=app:app database ./database
+COPY --chown=app:app monitoring ./monitoring
 
 USER app
 
