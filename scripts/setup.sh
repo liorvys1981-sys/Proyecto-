@@ -10,6 +10,7 @@ if [ ! -f .env ]; then
     printf '%s\n' "Created .env from .env.example."
     printf '%s\n' "Edit .env and replace every example value before running scripts/start.sh."
 else
+    chmod 600 .env
     printf '%s\n' ".env already exists; leaving it unchanged."
 fi
 

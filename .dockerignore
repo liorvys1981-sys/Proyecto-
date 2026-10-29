@@ -1,0 +1,11 @@
+.env
+.env.*
+.git
+.venv
+__pycache__
+**/__pycache__
+*.py[cod]
+*.db
+*.sqlite3
+backups/
+monitoring/secrets/
