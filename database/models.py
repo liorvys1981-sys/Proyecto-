@@ -54,6 +54,7 @@ class BillingInvoice(Base):
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     stripe_session_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
     checkout_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    consented_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 

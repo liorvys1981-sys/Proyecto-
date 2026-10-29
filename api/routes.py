@@ -20,7 +20,7 @@ from database.models import (
     UsageRecord,
 )
 from database.session import get_session
-from monitoring.health import AGENT_NAMES, agent_health, heartbeat
+from monitoring.health import agent_health, heartbeat
 
 router = APIRouter()
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -34,6 +34,7 @@ class AgentRunRequest(BaseModel):
 
 class CheckoutRequest(BaseModel):
     consent: bool
+    approved_amount_cents: int = Field(ge=0)
 
 
 async def resolve_tenant(
@@ -131,13 +132,11 @@ def _usage_summary(session: Session, tenant_id: str) -> dict:
             item.billable_cents - item.operating_cost_cents for item in entries
         ),
         "cpu_milliseconds": sum(item.cpu_milliseconds for item in entries),
-        "peak_memory_bytes": max((item.memory_bytes for item in entries), default=0),
         "events": [
             {
                 "agent": item.agent,
                 "feature": item.feature,
                 "cpu_milliseconds": item.cpu_milliseconds,
-                "memory_bytes": item.memory_bytes,
                 "billable_cents": item.billable_cents,
                 "operating_cost_cents": item.operating_cost_cents,
             }
@@ -161,8 +160,6 @@ def create_agent_run(
     session: SessionDependency,
     tenant_id: TenantDependency,
 ) -> dict:
-    for agent_name in AGENT_NAMES:
-        heartbeat(session, agent_name)
     try:
         run = run_workflow(
             session, tenant_id, request.goal, request.requires_approval
@@ -242,6 +239,10 @@ def create_checkout(
         .order_by(BillingInvoice.created_at.desc())
     )
     if previous_invoice and previous_invoice.status == "checkout_open":
+        if request.approved_amount_cents != previous_invoice.amount_cents:
+            raise HTTPException(
+                status_code=409, detail="Preview changed; confirm the displayed amount"
+            )
         return {
             "invoice_id": previous_invoice.id,
             "amount_cents": previous_invoice.amount_cents,
@@ -253,9 +254,22 @@ def create_checkout(
     if previous_invoice:
         invoice = previous_invoice
         amount = invoice.amount_cents
+        if request.approved_amount_cents != amount:
+            raise HTTPException(
+                status_code=409, detail="Preview changed; confirm the displayed amount"
+            )
+        invoice.consented_at = datetime.now(timezone.utc)
+        session.commit()
     else:
-        preview = _usage_summary(session, tenant_id)
-        amount = preview["billable_cents"]
+        usage = session.scalars(
+            select(UsageRecord)
+            .where(
+                UsageRecord.tenant_id == tenant_id,
+                UsageRecord.invoice_id.is_(None),
+            )
+            .with_for_update(skip_locked=True)
+        ).all()
+        amount = sum(entry.billable_cents for entry in usage)
         if amount <= 0:
             raise HTTPException(status_code=409, detail="There is no billable usage")
         if amount < 50:
@@ -263,22 +277,22 @@ def create_checkout(
                 status_code=409,
                 detail="Balance is below Stripe's minimum; usage will carry forward",
             )
+        if request.approved_amount_cents != amount:
+            raise HTTPException(
+                status_code=409, detail="Preview changed; confirm the displayed amount"
+            )
+        consented_at = datetime.now(timezone.utc)
         invoice = BillingInvoice(
             id=str(uuid4()),
             tenant_id=tenant_id,
             amount_cents=amount,
             status="checkout_pending",
             currency="usd",
-            created_at=datetime.now(timezone.utc),
+            consented_at=consented_at,
+            created_at=consented_at,
         )
         session.add(invoice)
         session.flush()
-        usage = session.scalars(
-            select(UsageRecord).where(
-                UsageRecord.tenant_id == tenant_id,
-                UsageRecord.invoice_id.is_(None),
-            )
-        ).all()
         for entry in usage:
             entry.invoice_id = invoice.id
         session.commit()
@@ -347,9 +361,11 @@ async def stripe_webhook(request: Request, session: SessionDependency) -> dict[s
         invoice = session.get(BillingInvoice, invoice_id) if invoice_id else None
         if (
             invoice
+            and invoice.tenant_id == checkout.get("metadata", {}).get("tenant_id")
             and invoice.stripe_session_id == checkout.get("id")
             and invoice.amount_cents == checkout.get("amount_total")
             and invoice.currency == checkout.get("currency")
+            and checkout.get("payment_status") == "paid"
         ):
             invoice.status = "paid"
     elif event.get("type") == "checkout.session.expired":
@@ -386,6 +402,7 @@ def admin_metrics(session: SessionDependency) -> dict:
             func.coalesce(func.sum(UsageRecord.cpu_milliseconds), 0),
             func.coalesce(func.sum(UsageRecord.operating_cost_cents), 0),
             func.coalesce(func.sum(UsageRecord.billable_cents), 0),
+            func.coalesce(func.max(UsageRecord.memory_bytes), 0),
         )
     ).one()
     return {
@@ -394,6 +411,7 @@ def admin_metrics(session: SessionDependency) -> dict:
         "estimated_operating_cost_cents": usage[2],
         "estimated_billable_cents": usage[3],
         "estimated_margin_cents": usage[3] - usage[2],
+        "peak_process_memory_bytes": usage[4],
     }
 
 
@@ -418,6 +436,9 @@ def prometheus_metrics(session: SessionDependency) -> str:
             "# HELP yimi_usage_revenue_cents_estimated Usage revenue before payment.",
             "# TYPE yimi_usage_revenue_cents_estimated gauge",
             f"yimi_usage_revenue_cents_estimated {metrics['estimated_billable_cents']}",
+            "# HELP yimi_process_peak_memory_bytes Process-wide peak RSS.",
+            "# TYPE yimi_process_peak_memory_bytes gauge",
+            f"yimi_process_peak_memory_bytes {metrics['peak_process_memory_bytes']}",
             "",
         ]
     )

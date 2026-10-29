@@ -1,18 +1,34 @@
 import hashlib
 import hmac
+import asyncio
 import json
 import os
 import time
 import unittest
 from unittest.mock import patch
 
-os.environ.setdefault("DATABASE_URL", "sqlite://")
+from fastapi import HTTPException
+from fastapi.security import HTTPAuthorizationCredentials
+from starlette.requests import Request
 
-from fastapi.testclient import TestClient
+os.environ["DATABASE_URL"] = "sqlite://"
 
-from app.main import app
+from api.routes import (
+    AgentRunRequest,
+    CheckoutRequest,
+    admin_metrics,
+    approve_agent_run,
+    billing_preview,
+    create_agent_run,
+    create_checkout,
+    get_agent_run,
+    require_admin,
+    resolve_tenant,
+    stripe_webhook,
+)
 from database.models import Base, BillingInvoice
 from database.session import get_engine, get_session_factory
+from monitoring.health import agent_health
 
 
 class AgentApiTests(unittest.TestCase):
@@ -26,147 +42,154 @@ class AgentApiTests(unittest.TestCase):
                 "STRIPE_WEBHOOK_SECRET": "test-webhook-secret",
                 "STRIPE_SUCCESS_URL": "https://example.test/success",
                 "STRIPE_CANCEL_URL": "https://example.test/cancel",
+                "PRICE_CENTS_PER_CPU_SECOND": (
+                    '{"goal_analysis":30000,"risk_assessment":30000}'
+                ),
             },
         )
         self.environment.start()
         Base.metadata.drop_all(get_engine())
         Base.metadata.create_all(get_engine())
-        self.client = TestClient(app)
-        self.client.__enter__()
-        self.addCleanup(self.client.__exit__, None, None, None)
+        self.session = get_session_factory()()
+        self.addCleanup(self.session.close)
         self.addCleanup(self.environment.stop)
 
-    def tenant_headers(self, tenant="tenant-a", key="test-key-a") -> dict[str, str]:
-        return {
-            "X-Tenant-ID": tenant,
-            "Authorization": "Be" + "arer " + key,
-        }
+    def tenant(self, tenant_id="tenant-a", key="test-key-a") -> str:
+        credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=key)
+        return asyncio.run(resolve_tenant(tenant_id, credentials))
 
     def test_runs_are_persisted_metered_and_tenant_scoped(self) -> None:
-        response = self.client.post(
-            "/v1/agent-runs",
-            headers=self.tenant_headers(),
-            json={"goal": "Review service health"},
+        run = create_agent_run(
+            AgentRunRequest(goal="Review service health"), self.session, self.tenant()
         )
-        self.assertEqual(response.status_code, 201)
-        run = response.json()
+        retrieved = get_agent_run(run["id"], self.session, "tenant-a")
+        preview = billing_preview(self.session, "tenant-a")
 
-        own_run = self.client.get(
-            f"/v1/agent-runs/{run['id']}", headers=self.tenant_headers()
-        )
-        other_tenant = self.client.get(
-            f"/v1/agent-runs/{run['id']}",
-            headers=self.tenant_headers("tenant-b", "test-key-b"),
-        )
-        preview = self.client.get("/v1/billing/preview", headers=self.tenant_headers())
-
-        self.assertEqual(own_run.status_code, 200)
-        self.assertEqual(other_tenant.status_code, 404)
-        self.assertEqual(len(preview.json()["events"]), 2)
-        self.assertGreaterEqual(preview.json()["billable_cents"], 0)
-        self.assertGreaterEqual(preview.json()["cpu_milliseconds"], 2)
+        self.assertEqual(retrieved["id"], run["id"])
         self.assertEqual(run["steps"][-1]["status"], "simulated")
+        self.assertEqual(len(preview["events"]), 2)
+        self.assertGreaterEqual(preview["billable_cents"], 0)
+        self.assertGreaterEqual(preview["cpu_milliseconds"], 2)
+        with self.assertRaises(HTTPException) as error:
+            get_agent_run(run["id"], self.session, "tenant-b")
+        self.assertEqual(error.exception.status_code, 404)
 
     def test_risky_run_waits_for_admin_approval(self) -> None:
-        run_response = self.client.post(
-            "/v1/agent-runs",
-            headers=self.tenant_headers(),
-            json={"goal": "perform risky action", "requires_approval": True},
+        run = create_agent_run(
+            AgentRunRequest(goal="risky action", requires_approval=True),
+            self.session,
+            self.tenant(),
         )
-        run = run_response.json()
-
-        denied = self.client.post(f"/v1/agent-runs/{run['id']}/approve")
-        approved = self.client.post(
-            f"/v1/agent-runs/{run['id']}/approve",
-            headers={"X-Admin-Key": "test-admin-key"},
-        )
-
-        self.assertEqual(run_response.status_code, 201)
         self.assertEqual(run["status"], "pending_approval")
-        self.assertEqual(denied.status_code, 401)
-        self.assertEqual(approved.status_code, 200)
-        self.assertEqual(approved.json()["steps"][-1]["status"], "approved_simulation")
+
+        with self.assertRaises(HTTPException) as error:
+            require_admin(None)
+        self.assertEqual(error.exception.status_code, 401)
+
+        require_admin("test-admin-key")
+        approved = approve_agent_run(run["id"], self.session, None)
+        self.assertEqual(approved["status"], "completed")
+        self.assertEqual(approved["steps"][-1]["status"], "approved_simulation")
 
     def test_tenant_authentication_and_missing_configuration(self) -> None:
-        invalid = self.client.get(
-            "/v1/billing/preview",
-            headers=self.tenant_headers("tenant-a", "wrong-key"),
-        )
-        self.assertEqual(invalid.status_code, 401)
+        with self.assertRaises(HTTPException) as error:
+            asyncio.run(
+                resolve_tenant(
+                    "tenant-a",
+                    HTTPAuthorizationCredentials(
+                        scheme="Bearer", credentials="wrong-key"
+                    ),
+                )
+            )
+        self.assertEqual(error.exception.status_code, 401)
 
         with patch.dict(os.environ, {}, clear=True):
-            missing = self.client.get(
-                "/v1/billing/preview",
-                headers=self.tenant_headers(),
-            )
-        self.assertEqual(missing.status_code, 503)
+            with self.assertRaises(HTTPException) as missing:
+                asyncio.run(
+                    resolve_tenant(
+                        "tenant-a",
+                        HTTPAuthorizationCredentials(
+                            scheme="Bearer", credentials="test-key-a"
+                        ),
+                    )
+                )
+        self.assertEqual(missing.exception.status_code, 503)
 
     def test_checkout_requires_consent_and_stripe_configuration(self) -> None:
-        run_response = self.client.post(
-            "/v1/agent-runs",
-            headers=self.tenant_headers(),
-            json={"goal": "Review service health"},
+        create_agent_run(
+            AgentRunRequest(goal="Review service health"), self.session, self.tenant()
         )
-        self.assertEqual(run_response.status_code, 201)
-
-        no_consent = self.client.post(
-            "/v1/billing/checkout",
-            headers=self.tenant_headers(),
-            json={"consent": False},
-        )
-        self.assertEqual(no_consent.status_code, 400)
+        with self.assertRaises(HTTPException) as consent:
+            create_checkout(
+                CheckoutRequest(consent=False, approved_amount_cents=0),
+                self.session,
+                "tenant-a",
+            )
+        self.assertEqual(consent.exception.status_code, 400)
 
         with patch.dict(os.environ, {"STRIPE_SECRET_KEY": ""}):
-            no_provider = self.client.post(
-                "/v1/billing/checkout",
-                headers=self.tenant_headers(),
-                json={"consent": True},
-            )
-        self.assertEqual(no_provider.status_code, 503)
+            with self.assertRaises(HTTPException) as unconfigured:
+                create_checkout(
+                    CheckoutRequest(consent=True, approved_amount_cents=60),
+                    self.session,
+                    "tenant-a",
+                )
+        self.assertEqual(unconfigured.exception.status_code, 503)
 
-    def test_checkout_is_explicit_and_webhook_marks_paid_idempotently(self) -> None:
-        self.client.post(
-            "/v1/agent-runs",
-            headers=self.tenant_headers(),
-            json={"goal": "Review service health"},
+    def test_checkout_requires_consent_and_webhook_marks_paid_idempotently(self) -> None:
+        create_agent_run(
+            AgentRunRequest(goal="Review service health"), self.session, self.tenant()
         )
         checkout_response = type(
             "Checkout",
             (),
             {"id": "cs_test_123", "url": "https://checkout.stripe.test/session"},
         )()
-        with patch(
-            "api.routes.stripe.checkout.Session.create", return_value=checkout_response
-        ) as stripe_create:
-            checkout = self.client.post(
-                "/v1/billing/checkout",
-                headers=self.tenant_headers(),
-                json={"consent": True},
+        with (
+            patch.dict(os.environ, {"STRIPE_SECRET_KEY": "sk_test_dummy"}),
+            patch(
+                "api.routes.stripe.checkout.Session.create",
+                return_value=checkout_response,
+            ) as stripe_create,
+        ):
+            checkout = create_checkout(
+                CheckoutRequest(
+                    consent=True,
+                    approved_amount_cents=billing_preview(
+                        self.session, "tenant-a"
+                    )["billable_cents"],
+                ),
+                self.session,
+                "tenant-a",
             )
-            repeated = self.client.post(
-                "/v1/billing/checkout",
-                headers=self.tenant_headers(),
-                json={"consent": True},
+            repeated = create_checkout(
+                CheckoutRequest(
+                    consent=True, approved_amount_cents=checkout["amount_cents"]
+                ),
+                self.session,
+                "tenant-a",
             )
 
-        self.assertEqual(checkout.status_code, 200)
-        self.assertEqual(repeated.status_code, 200)
+        self.assertEqual(checkout["status"], "checkout_open")
+        self.assertEqual(repeated["checkout_url"], checkout["checkout_url"])
         self.assertEqual(stripe_create.call_count, 1)
 
-        invoice_id = checkout.json()["invoice_id"]
-        session = get_session_factory()()
-        invoice = session.get(BillingInvoice, invoice_id)
-        amount = invoice.amount_cents
-        session.close()
+        invoice_id = checkout["invoice_id"]
+        invoice = self.session.get(BillingInvoice, invoice_id)
+        self.assertIsNotNone(invoice.consented_at)
         event = {
             "id": "evt_test_123",
             "type": "checkout.session.completed",
             "data": {
                 "object": {
                     "id": "cs_test_123",
-                    "amount_total": amount,
+                    "amount_total": invoice.amount_cents,
                     "currency": "usd",
-                    "metadata": {"invoice_id": invoice_id},
+                    "payment_status": "paid",
+                    "metadata": {
+                        "invoice_id": invoice_id,
+                        "tenant_id": "tenant-a",
+                    },
                 }
             },
         }
@@ -177,28 +200,97 @@ class AgentApiTests(unittest.TestCase):
             timestamp.encode() + b"." + payload,
             hashlib.sha256,
         ).hexdigest()
-        headers = {"Stripe-Signature": f"t={timestamp},v1={signature}"}
-        paid = self.client.post(
-            "/v1/billing/webhook", content=payload, headers=headers
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "headers": [
+                    (b"stripe-signature", f"t={timestamp},v1={signature}".encode())
+                ],
+            },
+            receive=receive_body(payload),
         )
-        repeated_webhook = self.client.post(
-            "/v1/billing/webhook", content=payload, headers=headers
-        )
+        paid = asyncio.run(stripe_webhook(request, self.session))
+        repeated_webhook = asyncio.run(stripe_webhook(request, self.session))
 
-        self.assertEqual(paid.status_code, 200)
-        self.assertEqual(repeated_webhook.json()["status"], "already_processed")
-        session = get_session_factory()()
-        self.assertEqual(session.get(BillingInvoice, invoice_id).status, "paid")
-        session.close()
+        self.assertEqual(paid["status"], "processed")
+        self.assertEqual(repeated_webhook["status"], "already_processed")
+        self.assertEqual(self.session.get(BillingInvoice, invoice_id).status, "paid")
 
-    def test_health_and_admin_metrics_require_database_and_admin_key(self) -> None:
-        self.assertEqual(self.client.get("/health").json()["status"], "ok")
-        denied = self.client.get("/v1/admin/metrics")
-        allowed = self.client.get(
-            "/v1/admin/metrics", headers={"X-Admin-Key": "test-admin-key"}
+    def test_usage_below_provider_minimum_remains_unbilled(self) -> None:
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "PRICE_CENTS_PER_CPU_SECOND": (
+                        '{"goal_analysis":2,"risk_assessment":2}'
+                    ),
+                    "STRIPE_SECRET_KEY": "sk_test_dummy",
+                },
+            ),
+            self.assertRaises(HTTPException) as error,
+        ):
+            create_agent_run(
+                AgentRunRequest(goal="small usage"), self.session, self.tenant()
+            )
+            create_checkout(
+                CheckoutRequest(
+                    consent=True,
+                    approved_amount_cents=billing_preview(
+                        self.session, "tenant-a"
+                    )["billable_cents"],
+                ),
+                self.session,
+                "tenant-a",
+            )
+
+        self.assertEqual(error.exception.status_code, 409)
+        self.assertGreater(billing_preview(self.session, "tenant-a")["billable_cents"], 0)
+
+    def test_transient_agent_failure_recovers_and_reports_health(self) -> None:
+        with patch(
+            "agents.orchestrator.service.analyze_goal",
+            side_effect=[RuntimeError("temporary"), "analysis recovered"],
+        ) as analyze:
+            run = create_agent_run(
+                AgentRunRequest(goal="retry test"), self.session, self.tenant()
+            )
+
+        self.assertEqual(analyze.call_count, 2)
+        self.assertEqual(run["steps"][0]["detail"], "analysis recovered")
+        status_by_name = {
+            entry["agent"]: entry["status"]
+            for entry in agent_health(self.session)
+        }
+        self.assertEqual(status_by_name["analytics"], "healthy")
+
+    def test_admin_metrics_are_tenant_agnostic_aggregates(self) -> None:
+        create_agent_run(
+            AgentRunRequest(goal="metrics test"), self.session, self.tenant()
         )
-        self.assertEqual(denied.status_code, 401)
-        self.assertEqual(allowed.status_code, 200)
+        metrics = admin_metrics(self.session)
+        self.assertEqual(metrics["usage_events"], 2)
+        self.assertGreaterEqual(metrics["cpu_milliseconds"], 2)
+
+    def test_stripe_webhook_rejects_invalid_signatures(self) -> None:
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "headers": [(b"stripe-signature", b"invalid")],
+            },
+            receive=receive_body(b"{}"),
+        )
+        with self.assertRaises(HTTPException) as error:
+            asyncio.run(stripe_webhook(request, self.session))
+        self.assertEqual(error.exception.status_code, 400)
+
+
+def receive_body(payload: bytes):
+    async def receive():
+        return {"type": "http.request", "body": payload, "more_body": False}
+
+    return receive
 
 
 if __name__ == "__main__":

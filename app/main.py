@@ -13,7 +13,7 @@ async def _heartbeat_worker() -> None:
         session = get_session_factory()()
         try:
             for name in AGENT_NAMES:
-                heartbeat(session, name)
+                heartbeat(session, name, "alive")
             session.commit()
         except Exception:
             session.rollback()

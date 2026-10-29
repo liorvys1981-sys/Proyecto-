@@ -12,12 +12,15 @@ HEARTBEAT_TIMEOUT = timedelta(seconds=120)
 def heartbeat(session: Session, name: str, state: str = "healthy", error: str | None = None):
     agent = session.get(AgentHeartbeat, name)
     if agent is None:
-        agent = AgentHeartbeat(name=name, status=state, last_seen_at=datetime.now(timezone.utc))
+        agent = AgentHeartbeat(
+            name=name, status=state, last_seen_at=datetime.now(timezone.utc)
+        )
         session.add(agent)
     else:
-        agent.status = state
         agent.last_seen_at = datetime.now(timezone.utc)
-        agent.last_error = error
+        if state != "alive" or agent.status not in ("unhealthy", "recovering"):
+            agent.status = state
+            agent.last_error = error
 
 
 def agent_health(session: Session) -> list[dict[str, str]]:
@@ -38,9 +41,16 @@ def agent_health(session: Session) -> list[dict[str, str]]:
         results.append(
             {
                 "agent": name,
-                "status": "stale" if stale else row.status,
+                "status": (
+                    "stale"
+                    if stale
+                    else "healthy"
+                    if row.status == "alive"
+                    else row.status
+                ),
                 "last_seen_at": seen.isoformat() if seen else "",
                 "alert": "heartbeat_missing_or_stale" if stale else "",
+                "last_error": row.last_error if row and row.last_error else "",
             }
         )
     return results
