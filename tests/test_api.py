@@ -399,6 +399,69 @@ class AgentApiTests(unittest.TestCase):
                 )
         self.assertEqual(missing.exception.status_code, 503)
 
+    def test_tenant_isolation_blocks_foreign_ids_and_billing_data(self) -> None:
+        run = self.enqueue_and_process("tenant isolation regression")
+        tenant_b = self.tenant("tenant-b", "test-key-b")
+
+        with self.assertRaises(HTTPException) as forged_tenant:
+            asyncio.run(
+                resolve_tenant(
+                    "tenant-b",
+                    HTTPAuthorizationCredentials(
+                        scheme="Bearer", credentials="test-key-a"
+                    ),
+                )
+            )
+        self.assertEqual(forged_tenant.exception.status_code, 401)
+
+        for endpoint in (
+            get_agent_run,
+            get_agent_run_decisions,
+            get_agent_run_subtasks,
+        ):
+            with self.subTest(endpoint=endpoint.__name__):
+                with self.assertRaises(HTTPException) as hidden_run:
+                    endpoint(run["id"], self.session, tenant_b)
+                self.assertEqual(hidden_run.exception.status_code, 404)
+
+        foreign_preview = billing_preview(self.session, tenant_b)
+        self.assertEqual(foreign_preview["total_tokens"], 0)
+        self.assertEqual(foreign_preview["events"], [])
+        with patch.dict(os.environ, {"STRIPE_SECRET_KEY": "sk_test_only"}):
+            with self.assertRaises(HTTPException) as foreign_checkout:
+                create_checkout(
+                    CheckoutRequest(
+                        consent=True,
+                        approved_amount_cents=billing_preview(
+                            self.session, "tenant-a"
+                        )["billable_cents"],
+                    ),
+                    self.session,
+                    tenant_b,
+                )
+        self.assertEqual(foreign_checkout.exception.status_code, 409)
+        self.assertEqual(
+            self.session.scalar(
+                select(AgentRunRecord.tenant_id).where(
+                    AgentRunRecord.id == run["id"]
+                )
+            ),
+            "tenant-a",
+        )
+        self.assertTrue(
+            all(
+                message.tenant_id == "tenant-a"
+                for message in self.session.scalars(
+                    select(AgentMessageRecord).where(
+                        AgentMessageRecord.run_id == run["id"]
+                    )
+                )
+            )
+        )
+        with self.assertRaises(HTTPException) as unauthorized_modification:
+            require_admin(None)
+        self.assertEqual(unauthorized_modification.exception.status_code, 401)
+
     def test_checkout_requires_consent_and_stripe_configuration(self) -> None:
         self.enqueue_and_process("billing consent test")
         with self.assertRaises(HTTPException) as consent:
