@@ -21,6 +21,13 @@ from database.models import (
 )
 from monitoring.health import diagnose_runtime, heartbeat
 
+SUBTASK_TRANSITIONS = {
+    "planned": {"running", "failed"},
+    "running": {"completed", "failed"},
+    "completed": set(),
+    "failed": set(),
+}
+
 
 def _record_decisions(
     session: Session, run: AgentRunRecord, decisions: list[AgentDecision]
@@ -56,6 +63,12 @@ def _update_subtask(
     )
     if subtask is None:
         return
+    if status == subtask.status:
+        return
+    if status not in SUBTASK_TRANSITIONS.get(subtask.status, set()):
+        raise RuntimeError(
+            f"Invalid subtask transition: {subtask.status} -> {status}"
+        )
     if status == "running" and subtask.depends_on:
         completed_dependencies = set(
             session.scalars(

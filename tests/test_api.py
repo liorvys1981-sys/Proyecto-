@@ -19,6 +19,7 @@ os.environ["DATABASE_URL"] = "sqlite://"
 
 from agents.bus import process_next_message, publish_decision
 from agents.orchestrator.service import (
+    _update_subtask,
     create_queued_run,
     expire_stuck_runs,
     process_next_run,
@@ -217,6 +218,52 @@ class AgentApiTests(unittest.TestCase):
         )
         self.assertEqual(security["status"], "review_required")
         self.assertFalse(security["evidence"]["external_actions_permitted"])
+
+    def test_subtask_dependencies_and_transitions_are_enforced(self) -> None:
+        run = create_queued_run(self.session, "tenant-a", "dependent subtask test")
+        parent = AgentSubtaskRecord(
+            id="dependency-parent",
+            tenant_id="tenant-a",
+            run_id=run.id,
+            task_key="parent",
+            agent="security",
+            depends_on=[],
+            status="planned",
+            attempts=0,
+            result={},
+            created_at=datetime.now(timezone.utc),
+        )
+        child = AgentSubtaskRecord(
+            id="dependency-child",
+            tenant_id="tenant-a",
+            run_id=run.id,
+            task_key="child",
+            agent="orchestrator",
+            depends_on=["parent"],
+            status="planned",
+            attempts=0,
+            result={},
+            created_at=datetime.now(timezone.utc),
+        )
+        self.session.add_all([parent, child])
+        self.session.commit()
+
+        with self.assertRaisesRegex(RuntimeError, "dependencies are not complete"):
+            _update_subtask(self.session, run.id, "child", "running")
+        self.session.refresh(child)
+        self.assertEqual((child.status, child.attempts), ("planned", 0))
+
+        _update_subtask(self.session, run.id, "parent", "running")
+        _update_subtask(self.session, run.id, "parent", "completed", {})
+        _update_subtask(self.session, run.id, "child", "running")
+        _update_subtask(self.session, run.id, "child", "completed", {})
+        _update_subtask(self.session, run.id, "child", "completed", {"duplicate": True})
+
+        with self.assertRaisesRegex(RuntimeError, "Invalid subtask transition"):
+            _update_subtask(self.session, run.id, "child", "running")
+        self.session.refresh(child)
+        self.assertEqual((child.status, child.attempts), ("completed", 1))
+        self.assertEqual(child.result, {})
 
     def test_agent_message_failure_retries_then_enters_dead_letter_queue(self) -> None:
         run = create_queued_run(self.session, "tenant-a", "message dlq run")
