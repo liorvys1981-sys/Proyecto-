@@ -2,7 +2,7 @@ import os
 from functools import lru_cache
 from typing import Generator
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -26,7 +26,44 @@ def get_session_factory():
 
 
 def initialize_database() -> None:
-    Base.metadata.create_all(get_engine())
+    engine = get_engine()
+    Base.metadata.create_all(engine)
+    columns = {
+        column["name"] for column in inspect(engine).get_columns("usage_records")
+    }
+    new_columns = {
+        "input_tokens": "INTEGER NOT NULL DEFAULT 0",
+        "output_tokens": "INTEGER NOT NULL DEFAULT 0",
+        "provider_cost_micro_usd": "INTEGER NOT NULL DEFAULT 0",
+        "input_provider_cost_micro_usd": "INTEGER NOT NULL DEFAULT 0",
+        "output_provider_cost_micro_usd": "INTEGER NOT NULL DEFAULT 0",
+        "input_sell_price_micro_usd": "INTEGER NOT NULL DEFAULT 0",
+        "output_sell_price_micro_usd": "INTEGER NOT NULL DEFAULT 0",
+        "sell_price_micro_usd": "INTEGER NOT NULL DEFAULT 0",
+        "markup_bps": "INTEGER NOT NULL DEFAULT 0",
+    }
+    with engine.begin() as connection:
+        for column_name, definition in new_columns.items():
+            if column_name not in columns:
+                connection.execute(
+                    text(
+                        f"ALTER TABLE usage_records ADD COLUMN {column_name} {definition}"
+                    )
+                )
+        run_columns = {
+            column["name"] for column in inspect(connection).get_columns("agent_runs")
+        }
+        if "approval_required" not in run_columns:
+            connection.execute(
+                text(
+                    "ALTER TABLE agent_runs ADD COLUMN approval_required "
+                    "BOOLEAN NOT NULL DEFAULT FALSE"
+                )
+            )
+        if "processing_started_at" not in run_columns:
+            connection.execute(
+                text("ALTER TABLE agent_runs ADD COLUMN processing_started_at TIMESTAMP")
+            )
 
 
 def get_session() -> Generator[Session, None, None]:

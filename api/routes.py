@@ -11,8 +11,18 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
-from agents.orchestrator.service import run_workflow
-from config.settings import setting, tenant_api_keys
+from agents.monetization.token_pricing import MICRO_USD_PER_CENT, ceil_div
+from agents.orchestrator.service import create_queued_run
+from config.settings import (
+    openai_api_key,
+    max_monthly_tokens_per_tenant,
+    max_output_tokens,
+    max_queued_runs_per_tenant,
+    setting,
+    tenant_api_keys,
+    token_price_tiers,
+    validate_token_pricing,
+)
 from database.models import (
     AgentRunRecord,
     BillingInvoice,
@@ -104,6 +114,26 @@ def _serialize_run(run: AgentRunRecord) -> dict:
         "created_at": run.created_at,
         "steps": run.steps,
         "result": run.result,
+        "usage": [
+            {
+                "model": usage.agent,
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "total_tokens": usage.input_tokens + usage.output_tokens,
+                "provider_cost_micro_usd": usage.provider_cost_micro_usd,
+                "input_provider_cost_micro_usd": (
+                    usage.input_provider_cost_micro_usd
+                ),
+                "output_provider_cost_micro_usd": (
+                    usage.output_provider_cost_micro_usd
+                ),
+                "sell_price_micro_usd": usage.sell_price_micro_usd,
+                "input_sell_price_micro_usd": usage.input_sell_price_micro_usd,
+                "output_sell_price_micro_usd": usage.output_sell_price_micro_usd,
+                "markup_bps": usage.markup_bps,
+            }
+            for usage in run.usage
+        ],
     }
 
 
@@ -119,26 +149,48 @@ def _usage_summary(session: Session, tenant_id: str) -> dict:
             UsageRecord.invoice_id.is_(None),
         )
     ).all()
+    provider_cost_micro_usd = sum(
+        item.provider_cost_micro_usd for item in entries
+    )
+    sell_price_micro_usd = sum(item.sell_price_micro_usd for item in entries)
     return {
         "period_start": min(
             (item.created_at for item in entries), default=_month_start(now)
         ),
         "currency": "usd",
-        "billable_cents": sum(item.billable_cents for item in entries),
-        "estimated_operating_cost_cents": sum(
-            item.operating_cost_cents for item in entries
+        "billable_cents": ceil_div(sell_price_micro_usd, MICRO_USD_PER_CENT),
+        "estimated_operating_cost_cents": ceil_div(
+            provider_cost_micro_usd, MICRO_USD_PER_CENT
         ),
-        "estimated_margin_cents": sum(
-            item.billable_cents - item.operating_cost_cents for item in entries
+        "estimated_margin_cents": ceil_div(
+            sell_price_micro_usd, MICRO_USD_PER_CENT
+        )
+        - ceil_div(provider_cost_micro_usd, MICRO_USD_PER_CENT),
+        "input_tokens": sum(item.input_tokens for item in entries),
+        "output_tokens": sum(item.output_tokens for item in entries),
+        "total_tokens": sum(
+            item.input_tokens + item.output_tokens for item in entries
         ),
-        "cpu_milliseconds": sum(item.cpu_milliseconds for item in entries),
+        "provider_cost_micro_usd": provider_cost_micro_usd,
+        "sell_price_micro_usd": sell_price_micro_usd,
+        "price_tiers": token_price_tiers(),
         "events": [
             {
                 "agent": item.agent,
                 "feature": item.feature,
-                "cpu_milliseconds": item.cpu_milliseconds,
-                "billable_cents": item.billable_cents,
-                "operating_cost_cents": item.operating_cost_cents,
+                "input_tokens": item.input_tokens,
+                "output_tokens": item.output_tokens,
+                "provider_cost_micro_usd": item.provider_cost_micro_usd,
+                "input_provider_cost_micro_usd": (
+                    item.input_provider_cost_micro_usd
+                ),
+                "output_provider_cost_micro_usd": (
+                    item.output_provider_cost_micro_usd
+                ),
+                "sell_price_micro_usd": item.sell_price_micro_usd,
+                "input_sell_price_micro_usd": item.input_sell_price_micro_usd,
+                "output_sell_price_micro_usd": item.output_sell_price_micro_usd,
+                "markup_bps": item.markup_bps,
             }
             for item in entries
         ],
@@ -154,21 +206,68 @@ def health(session: SessionDependency) -> dict[str, str]:
     return {"status": "ok"}
 
 
-@router.post("/v1/agent-runs", status_code=status.HTTP_201_CREATED)
+@router.post("/v1/agent-runs", status_code=status.HTTP_202_ACCEPTED)
 def create_agent_run(
     request: AgentRunRequest,
     session: SessionDependency,
     tenant_id: TenantDependency,
 ) -> dict:
-    try:
-        run = run_workflow(
-            session, tenant_id, request.goal, request.requires_approval
+    if not openai_api_key():
+        raise HTTPException(
+            status_code=503, detail="GPT-4o worker is not configured"
         )
-        session.commit()
-        session.refresh(run)
-    except Exception:
-        session.rollback()
-        raise
+    try:
+        validate_token_pricing()
+    except RuntimeError as error:
+        raise HTTPException(
+            status_code=503, detail="Token pricing configuration is invalid"
+        ) from error
+    active_jobs = session.scalar(
+        select(func.count(AgentRunRecord.id)).where(
+            AgentRunRecord.tenant_id == tenant_id,
+            AgentRunRecord.status.in_(("queued", "processing")),
+        )
+    )
+    if active_jobs >= max_queued_runs_per_tenant():
+        raise HTTPException(
+            status_code=429, detail="Tenant agent queue is at capacity"
+        )
+    month_start = _month_start(datetime.now(timezone.utc))
+    monthly_tokens = session.scalar(
+        select(
+            func.coalesce(
+                func.sum(UsageRecord.input_tokens + UsageRecord.output_tokens), 0
+            )
+        ).where(
+            UsageRecord.tenant_id == tenant_id,
+            UsageRecord.created_at >= month_start,
+        )
+    ) or 0
+    reserved_tokens = session.scalar(
+        select(
+            func.coalesce(
+                func.sum(func.length(AgentRunRecord.goal) + max_output_tokens()), 0
+            )
+        ).where(
+            AgentRunRecord.tenant_id == tenant_id,
+            AgentRunRecord.status.in_(("queued", "processing")),
+            AgentRunRecord.created_at >= month_start,
+        )
+    ) or 0
+    if (
+        monthly_tokens
+        + reserved_tokens
+        + len(request.goal)
+        + max_output_tokens()
+        > max_monthly_tokens_per_tenant()
+    ):
+        raise HTTPException(
+            status_code=429,
+            detail="Tenant monthly GPT-4o token budget is exhausted",
+        )
+    run = create_queued_run(
+        session, tenant_id, request.goal, request.requires_approval
+    )
     return _serialize_run(run)
 
 
@@ -269,7 +368,10 @@ def create_checkout(
             )
             .with_for_update(skip_locked=True)
         ).all()
-        amount = sum(entry.billable_cents for entry in usage)
+        amount = ceil_div(
+            sum(entry.sell_price_micro_usd for entry in usage),
+            MICRO_USD_PER_CENT,
+        )
         if amount <= 0:
             raise HTTPException(status_code=409, detail="There is no billable usage")
         if amount < 50:
@@ -399,19 +501,23 @@ def admin_metrics(session: SessionDependency) -> dict:
     usage = session.execute(
         select(
             func.count(UsageRecord.id),
-            func.coalesce(func.sum(UsageRecord.cpu_milliseconds), 0),
-            func.coalesce(func.sum(UsageRecord.operating_cost_cents), 0),
-            func.coalesce(func.sum(UsageRecord.billable_cents), 0),
-            func.coalesce(func.max(UsageRecord.memory_bytes), 0),
+            func.coalesce(func.sum(UsageRecord.provider_cost_micro_usd), 0),
+            func.coalesce(func.sum(UsageRecord.sell_price_micro_usd), 0),
+            func.coalesce(func.sum(UsageRecord.input_tokens), 0),
+            func.coalesce(func.sum(UsageRecord.output_tokens), 0),
         )
     ).one()
     return {
         "usage_events": usage[0],
-        "cpu_milliseconds": usage[1],
-        "estimated_operating_cost_cents": usage[2],
-        "estimated_billable_cents": usage[3],
-        "estimated_margin_cents": usage[3] - usage[2],
-        "peak_process_memory_bytes": usage[4],
+        "estimated_operating_cost_cents": ceil_div(
+            usage[1], MICRO_USD_PER_CENT
+        ),
+        "estimated_billable_cents": ceil_div(usage[2], MICRO_USD_PER_CENT),
+        "estimated_margin_cents": ceil_div(usage[2], MICRO_USD_PER_CENT)
+        - ceil_div(usage[1], MICRO_USD_PER_CENT),
+        "input_tokens": usage[3],
+        "output_tokens": usage[4],
+        "total_tokens": usage[3] + usage[4],
     }
 
 
@@ -427,18 +533,18 @@ def prometheus_metrics(session: SessionDependency) -> str:
             "# HELP yimi_usage_events_total Recorded agent usage events.",
             "# TYPE yimi_usage_events_total counter",
             f"yimi_usage_events_total {metrics['usage_events']}",
-            "# HELP yimi_cpu_milliseconds_total Measured agent CPU time.",
-            "# TYPE yimi_cpu_milliseconds_total counter",
-            f"yimi_cpu_milliseconds_total {metrics['cpu_milliseconds']}",
+            "# HELP yimi_gpt4o_input_tokens_total GPT-4o input tokens.",
+            "# TYPE yimi_gpt4o_input_tokens_total counter",
+            f"yimi_gpt4o_input_tokens_total {metrics['input_tokens']}",
+            "# HELP yimi_gpt4o_output_tokens_total GPT-4o output tokens.",
+            "# TYPE yimi_gpt4o_output_tokens_total counter",
+            f"yimi_gpt4o_output_tokens_total {metrics['output_tokens']}",
             "# HELP yimi_operating_cost_cents_estimated Estimated operating cost.",
             "# TYPE yimi_operating_cost_cents_estimated gauge",
             f"yimi_operating_cost_cents_estimated {metrics['estimated_operating_cost_cents']}",
             "# HELP yimi_usage_revenue_cents_estimated Usage revenue before payment.",
             "# TYPE yimi_usage_revenue_cents_estimated gauge",
             f"yimi_usage_revenue_cents_estimated {metrics['estimated_billable_cents']}",
-            "# HELP yimi_process_peak_memory_bytes Process-wide peak RSS.",
-            "# TYPE yimi_process_peak_memory_bytes gauge",
-            f"yimi_process_peak_memory_bytes {metrics['peak_process_memory_bytes']}",
             "",
         ]
     )

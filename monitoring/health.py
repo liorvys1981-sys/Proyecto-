@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 
 from database.models import AgentHeartbeat
 
-AGENT_NAMES = ("analytics", "security", "orchestrator", "billing")
+AGENT_NAMES = ("gpt4o", "orchestrator", "billing")
 HEARTBEAT_TIMEOUT = timedelta(seconds=120)
 
 

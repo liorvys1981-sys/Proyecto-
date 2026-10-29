@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, JSON, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, JSON, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -18,6 +18,10 @@ class AgentRunRecord(Base):
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     result: Mapped[str] = mapped_column(Text, nullable=False)
     steps: Mapped[list[dict[str, str]]] = mapped_column(JSON, nullable=False)
+    approval_required: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    processing_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     usage: Mapped[list["UsageRecord"]] = relationship(
         back_populates="run", cascade="all, delete-orphan"
@@ -37,6 +41,27 @@ class UsageRecord(Base):
     memory_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
     billable_cents: Mapped[int] = mapped_column(Integer, nullable=False)
     operating_cost_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    provider_cost_micro_usd: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    input_provider_cost_micro_usd: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    output_provider_cost_micro_usd: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    input_sell_price_micro_usd: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    output_sell_price_micro_usd: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    sell_price_micro_usd: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    markup_bps: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     invoice_id: Mapped[str | None] = mapped_column(
         ForeignKey("billing_invoices.id"), nullable=True
