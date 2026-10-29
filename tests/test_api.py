@@ -385,6 +385,10 @@ class AgentApiTests(unittest.TestCase):
         self.assertIn("finished_at", run_columns)
         self.assertIn("idempotency_key", run_columns)
         self.assertIn("request_hash", run_columns)
+        run_indexes = {
+            index["name"] for index in inspect(legacy_engine).get_indexes("agent_runs")
+        }
+        self.assertIn("uq_agent_runs_tenant_idempotency_key", run_indexes)
         self.assertIn("input_tokens", usage_columns)
         self.assertIn("sell_price_micro_usd", usage_columns)
         legacy_engine.dispose()
@@ -448,6 +452,8 @@ class AgentApiTests(unittest.TestCase):
         self.assertIn("yimi_queued_runs 1", metrics)
         self.assertIn("yimi_processing_runs 0", metrics)
         self.assertIn('yimi_agent_healthy{agent="gpt4o"} 0', metrics)
+        self.assertIn("yimi_run_success_rate_ratio 0.0", metrics)
+        self.assertIn("yimi_run_execution_duration_p95_milliseconds 0", metrics)
 
     def test_tier_configuration_is_monotonic_and_threshold_based(self) -> None:
         self.assertEqual(token_price_tiers()[0]["monthly_tokens"], 0)

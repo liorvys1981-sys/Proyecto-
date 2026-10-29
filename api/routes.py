@@ -270,9 +270,9 @@ def create_agent_run(
     request: AgentRunRequest,
     session: SessionDependency,
     tenant_id: TenantDependency,
-    idempotency_key: str | None = Header(
-        default=None, alias="Idempotency-Key", max_length=128
-    ),
+    idempotency_key: Annotated[
+        str | None, Header(alias="Idempotency-Key", max_length=128)
+    ] = None,
 ) -> dict:
     if not openai_api_key():
         raise HTTPException(
