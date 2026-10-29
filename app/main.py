@@ -21,7 +21,9 @@ bearer_scheme = HTTPBearer(auto_error=False)
 
 @lru_cache
 def tenant_api_keys() -> dict[str, str]:
-    raw_keys = os.getenv("TENANT_API_KEYS", "{}")
+    raw_keys = os.getenv("TENANT_API_KEYS")
+    if raw_keys is None:
+        raise RuntimeError("TENANT_API_KEYS must be configured")
     try:
         keys = json.loads(raw_keys)
     except json.JSONDecodeError as error:

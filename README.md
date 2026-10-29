@@ -59,4 +59,4 @@ Esta base **no está lista para producción**. Antes de ofrecerla como SaaS empr
 
 ## Configuración
 
-`TENANT_API_KEYS` es un objeto JSON que relaciona IDs de tenant con claves. La configuración se carga una vez por proceso; para aplicar cambios, reinicia el servicio. Sin claves configuradas, las rutas de tenant devuelven `503`; las credenciales inválidas reciben `401`.
+`TENANT_API_KEYS` es un objeto JSON que relaciona IDs de tenant con claves. La configuración se carga una vez por proceso; para aplicar cambios, reinicia el servicio. Las credenciales ausentes o inválidas reciben `401`; si falta la configuración de tenant, las solicitudes autenticadas reciben `503`.

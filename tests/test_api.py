@@ -76,6 +76,21 @@ class AgentApiTests(unittest.TestCase):
 
         self.assertEqual(error.exception.status_code, 401)
 
+    def test_missing_tenant_configuration_is_unavailable(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            main.tenant_api_keys.cache_clear()
+            with self.assertRaises(HTTPException) as error:
+                asyncio.run(
+                    main.resolve_tenant(
+                        "tenant-a",
+                        HTTPAuthorizationCredentials(
+                            scheme="Bearer", credentials="test-key-a"
+                        ),
+                    )
+                )
+
+        self.assertEqual(error.exception.status_code, 503)
+
 
 if __name__ == "__main__":
     unittest.main()
