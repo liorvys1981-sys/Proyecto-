@@ -1,0 +1,164 @@
+{
+  "id": null,
+  "uid": "yimi-overview",
+  "title": "YIMI Operations",
+  "tags": ["yimi", "operations"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "API replicas up",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "yimi-prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum(up{job=\"yimi-api\"})",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 0,
+        "y": 0
+      }
+    },
+    {
+      "id": 2,
+      "title": "Queued tasks",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "yimi-prometheus"
+      },
+      "targets": [
+        {
+          "expr": "max(yimi_queued_runs)",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 6,
+        "y": 0
+      }
+    },
+    {
+      "id": 3,
+      "title": "Agent heartbeat health",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "yimi-prometheus"
+      },
+      "targets": [
+        {
+          "expr": "yimi_agent_healthy",
+          "legendFormat": "{{agent}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 5
+      }
+    },
+    {
+      "id": 4,
+      "title": "Run success rate",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "yimi-prometheus"
+      },
+      "targets": [
+        {
+          "expr": "yimi_run_success_rate_ratio",
+          "legendFormat": "success rate",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 5
+      }
+    },
+    {
+      "id": 5,
+      "title": "GPT-4o tokens per second",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "yimi-prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(yimi_gpt4o_input_tokens_total[5m]))",
+          "legendFormat": "input",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(yimi_gpt4o_output_tokens_total[5m]))",
+          "legendFormat": "output",
+          "refId": "B"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 13
+      }
+    },
+    {
+      "id": 6,
+      "title": "P95 execution duration",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "yimi-prometheus"
+      },
+      "targets": [
+        {
+          "expr": "yimi_run_execution_duration_p95_milliseconds",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 13
+      }
+    }
+  ]
+}

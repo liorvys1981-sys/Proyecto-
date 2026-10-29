@@ -45,15 +45,17 @@ curl -X POST http://localhost:8000/v1/agent-runs \
 ## Docker: worker 24/7 supervisado
 
 ```bash
-cp .env.example .env
-# Configura OPENAI_API_KEY, claves aleatorias y credenciales de Stripe si las usarás.
-docker compose --env-file .env -f docker/docker-compose.yml up --build -d
-docker compose --env-file .env -f docker/docker-compose.yml ps
+./scripts/setup.sh
+# Edita .env: configura claves aleatorias, OpenAI y la contraseña de Grafana.
+./scripts/start.sh
+docker compose ps
 ```
 
 Compose mantiene dos procesos API/worker con `restart: unless-stopped`, una cola PostgreSQL persistente y Nginx. Cada worker reclama trabajos mediante una actualización atómica para evitar que ambas réplicas procesen la misma tarea. Trabajos que quedan atascados se marcan fallidos y no se repiten automáticamente: así se evita una segunda llamada/costo potencial. Si la conexión se pierde después de que OpenAI haya procesado una petición, el proveedor podría haber cobrado aunque YIMI no recibiera el uso para registrarlo; revisa esos fallos antes de reenviar.
 
 Esto da operación supervisada mientras el host, Docker, red, OpenAI y base de datos estén disponibles; **no garantiza un SLA ni disponibilidad real 24/7**. En esta configuración Nginx y PostgreSQL siguen siendo puntos únicos de fallo. Para producción usa base de datos administrada con alta disponibilidad, backups probados, TLS, secretos administrados y monitoreo externo. No guardes `.env` en Git.
+
+Grafana queda disponible solo en `http://127.0.0.1:3000`, con contraseña inicial definida por `GRAFANA_ADMIN_PASSWORD`; el dashboard se aprovisiona desde los archivos versionados. Cambia la contraseña de ejemplo antes de arrancar. Para acceso remoto, usa un proxy con TLS y autenticación, no publiques el puerto de Grafana directamente.
 
 ## Costos de GPT-4o y precios de venta
 
@@ -83,7 +85,9 @@ Los prompts se envían a OpenAI para generar respuestas. No se envían herramien
 
 `GET /health` prueba la base de datos. `/v1/admin/health` informa heartbeats obsoletos después de 120 segundos; `/v1/admin/metrics` muestra tokens y costos estimados. Compose incluye Prometheus con retención persistente de 15 días y reglas para réplicas API caídas, heartbeats obsoletos y acumulación de la cola. Las métricas exponen también el total de tareas en espera y en proceso.
 
-Antes de arrancar Compose, crea `monitoring/secrets/admin-key` con el mismo valor que `ADMIN_API_KEY` y limita sus permisos al usuario que ejecuta Docker. No lo guardes en Git ni lo publiques. Prometheus no expone un puerto al host; las reglas disparan alertas visibles en su interfaz interna, pero **no envían notificaciones externas** hasta integrar y configurar un receptor de Alertmanager. Las métricas son agregados de la base de datos compartida, no una prueba independiente de disponibilidad del host.
+`scripts/start.sh` crea `monitoring/secrets/admin-key` con permisos restrictivos a partir de `ADMIN_API_KEY`. Usa para esa variable un valor aleatorio sin comillas ni espacios, igual que en `.env`; nunca guardes el archivo generado en Git. Prometheus no expone un puerto al host; las reglas disparan alertas visibles en su interfaz interna, pero **no envían notificaciones externas** hasta integrar y configurar un receptor de Alertmanager. Las métricas son agregados de la base de datos compartida, no una prueba independiente de disponibilidad del host.
+
+Los scripts `scripts/setup.sh` y `scripts/start.sh` preparan directorios y arranque local; `scripts/backup.sh` genera un dump PostgreSQL en `backups/`. Un dump creado no demuestra que sea recuperable: prueba la restauración en una base aislada antes de depender de él. El catálogo `config/agents_config.yaml` distingue módulos existentes de agentes autónomos completos; sirve como inventario y no habilita capacidades runtime.
 
 ## Pruebas
 

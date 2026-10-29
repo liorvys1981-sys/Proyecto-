@@ -1,0 +1,30 @@
+version: 1
+provider:
+  name: openai
+  model: gpt-4o
+  tools_enabled: false
+agents:
+  - id: master_orchestrator
+    module: agents.orchestrator.service
+    status: implemented
+    scope: Durable task queue, single-run claiming, and GPT-4o dispatch.
+  - id: monetization
+    module: agents.monetization.token_pricing
+    status: implemented
+    scope: Token cost estimation and configurable resale tiers.
+  - id: devops
+    module: monitoring.health
+    status: partial
+    scope: Health checks and alerts; no autonomous infrastructure changes.
+  - id: resources
+    module: agents.resources.service
+    status: partial
+    scope: Resource measurement helper exists but is not wired into run accounting.
+  - id: security
+    module: agents.security.service
+    status: partial
+    scope: Human approval flag and restricted no-tools execution; no policy engine.
+  - id: analytics
+    module: api.routes.admin_metrics
+    status: partial
+    scope: Operational and usage aggregates; no quality or customer profitability analysis.
