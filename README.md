@@ -6,12 +6,12 @@ La organización toma como referencia conceptual la estructura de [ECO.IA](https
 
 ## Capacidades
 
-- `POST /v1/agent-runs` encola una tarea durable y responde `202`. El worker la procesa usando una única llamada a `gpt-4o`, con salida limitada, sin herramientas y sin reintentos automáticos del SDK.
+- `POST /v1/agent-runs` encola una tarea durable y responde `202`. El worker la procesa usando una única llamada a `gpt-4o`, con salida limitada, sin herramientas y sin reintentos automáticos del SDK. Envía un `Idempotency-Key` único por solicitud para recibir el mismo run si el cliente reintenta el POST; reutilizarlo con otro contenido devuelve `409`.
 - `GET /v1/agent-runs/{id}` consulta estado y resultado de una tarea del tenant autenticado: `queued`, `processing`, `completed`, `pending_approval` o `failed`.
 - `GET /v1/billing/preview` muestra tokens de entrada/salida, costo estimado del proveedor, precio de venta por nivel y margen estimado para consumos todavía no facturados.
 - `POST /v1/billing/checkout` cobra mediante Stripe solo tras consentimiento explícito y confirmación del importe exacto mostrado. El cliente confirma el pago en Stripe; nunca hay un cargo silencioso.
 - `/v1/billing/webhook` verifica firma, factura, tenant, sesión, importe, moneda y estado de pago; evita procesar el mismo evento más de una vez.
-- Endpoints administrativos muestran salud de worker, cola y métricas globales; requieren `X-Admin-Key`. Prometheus lee su credencial de un archivo protegido configurado en `monitoring/prometheus.yml`.
+- Endpoints administrativos muestran salud de worker, cola, tasa de éxito y p95 de duración de ejecución sobre hasta las últimas 5.000 ejecuciones exitosas; requieren `X-Admin-Key`. Prometheus lee su credencial de un archivo protegido configurado en `monitoring/prometheus.yml`.
 - Las operaciones que pidan aprobación quedan en espera. La aprobación es informativa: el agente no dispone de herramientas para ejecutar acciones reales.
 
 ## Arranque local

@@ -1,3 +1,6 @@
+import hashlib
+import json
+import math
 import secrets
 from datetime import datetime, timezone
 from typing import Annotated
@@ -9,6 +12,7 @@ from fastapi.responses import PlainTextResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from agents.monetization.token_pricing import MICRO_USD_PER_CENT, ceil_div
@@ -109,11 +113,21 @@ AdminDependency = Annotated[None, Depends(require_admin)]
 
 
 def _serialize_run(run: AgentRunRecord) -> dict:
+    queue_duration_ms = _duration_ms(run.created_at, run.processing_started_at)
+    execution_duration_ms = _duration_ms(
+        run.processing_started_at, run.finished_at
+    )
+    total_duration_ms = _duration_ms(run.created_at, run.finished_at)
     return {
         "id": run.id,
         "status": run.status,
         "goal": run.goal,
         "created_at": run.created_at,
+        "processing_started_at": run.processing_started_at,
+        "finished_at": run.finished_at,
+        "queue_duration_ms": queue_duration_ms,
+        "execution_duration_ms": execution_duration_ms,
+        "total_duration_ms": total_duration_ms,
         "steps": run.steps,
         "result": run.result,
         "usage": [
@@ -137,6 +151,42 @@ def _serialize_run(run: AgentRunRecord) -> dict:
             for usage in run.usage
         ],
     }
+
+
+def _duration_ms(start: datetime | None, end: datetime | None) -> int | None:
+    if start is None or end is None:
+        return None
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    return max(0, int((end - start).total_seconds() * 1000))
+
+
+def _request_fingerprint(request: AgentRunRequest) -> str:
+    payload = json.dumps(
+        {"goal": request.goal, "requires_approval": request.requires_approval},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _find_idempotent_run(
+    session: Session, tenant_id: str, key: str, request_hash: str
+) -> AgentRunRecord | None:
+    run = session.scalar(
+        select(AgentRunRecord).where(
+            AgentRunRecord.tenant_id == tenant_id,
+            AgentRunRecord.idempotency_key == key,
+        )
+    )
+    if run and run.request_hash != request_hash:
+        raise HTTPException(
+            status_code=409,
+            detail="Idempotency-Key was already used with a different request",
+        )
+    return run
 
 
 def _month_start(now: datetime) -> datetime:
@@ -220,6 +270,9 @@ def create_agent_run(
     request: AgentRunRequest,
     session: SessionDependency,
     tenant_id: TenantDependency,
+    idempotency_key: str | None = Header(
+        default=None, alias="Idempotency-Key", max_length=128
+    ),
 ) -> dict:
     if not openai_api_key():
         raise HTTPException(
@@ -232,6 +285,19 @@ def create_agent_run(
             ),
             {"tenant_id": tenant_id},
         )
+    if idempotency_key is not None:
+        if not idempotency_key or idempotency_key.strip() != idempotency_key:
+            raise HTTPException(
+                status_code=400, detail="Idempotency-Key must be non-empty and trimmed"
+            )
+        request_hash = _request_fingerprint(request)
+        existing_run = _find_idempotent_run(
+            session, tenant_id, idempotency_key, request_hash
+        )
+        if existing_run is not None:
+            return _serialize_run(existing_run)
+    else:
+        request_hash = None
     try:
         validate_token_pricing()
     except RuntimeError as error:
@@ -284,9 +350,25 @@ def create_agent_run(
             status_code=429,
             detail="Tenant monthly GPT-4o token budget is exhausted",
         )
-    run = create_queued_run(
-        session, tenant_id, request.goal, request.requires_approval
-    )
+    try:
+        run = create_queued_run(
+            session,
+            tenant_id,
+            request.goal,
+            request.requires_approval,
+            idempotency_key,
+            request_hash,
+        )
+    except IntegrityError:
+        session.rollback()
+        if idempotency_key is None:
+            raise
+        existing_run = _find_idempotent_run(
+            session, tenant_id, idempotency_key, request_hash
+        )
+        if existing_run is None:
+            raise
+        return _serialize_run(existing_run)
     return _serialize_run(run)
 
 
@@ -527,6 +609,36 @@ def admin_metrics(session: SessionDependency) -> dict:
             func.coalesce(func.sum(UsageRecord.output_tokens), 0),
         )
     ).one()
+    run_status_counts = dict(
+        session.execute(
+            select(AgentRunRecord.status, func.count()).group_by(
+                AgentRunRecord.status
+            )
+        ).all()
+    )
+    run_durations = [
+        duration
+        for started_at, finished_at in session.execute(
+            select(
+                AgentRunRecord.processing_started_at,
+                AgentRunRecord.finished_at,
+            )
+            .where(
+                AgentRunRecord.status.in_(("completed", "pending_approval")),
+                AgentRunRecord.processing_started_at.is_not(None),
+                AgentRunRecord.finished_at.is_not(None),
+            )
+            .order_by(AgentRunRecord.finished_at.desc())
+            .limit(5000)
+        )
+        if (duration := _duration_ms(started_at, finished_at)) is not None
+    ]
+    run_durations.sort()
+    successful_runs = run_status_counts.get("completed", 0) + run_status_counts.get(
+        "pending_approval", 0
+    )
+    total_runs = sum(run_status_counts.values())
+    p95_index = max(0, math.ceil(len(run_durations) * 0.95) - 1)
     return {
         "usage_events": usage[0],
         "estimated_operating_cost_cents": ceil_div(
@@ -538,6 +650,13 @@ def admin_metrics(session: SessionDependency) -> dict:
         "input_tokens": usage[3],
         "output_tokens": usage[4],
         "total_tokens": usage[3] + usage[4],
+        "total_runs": total_runs,
+        "successful_runs": successful_runs,
+        "failed_runs": run_status_counts.get("failed", 0),
+        "success_rate": successful_runs / total_runs if total_runs else 0,
+        "p95_execution_duration_ms": (
+            run_durations[p95_index] if run_durations else 0
+        ),
     }
 
 
@@ -584,6 +703,15 @@ def prometheus_metrics(session: SessionDependency) -> str:
                 f'{int(agent["status"] == "healthy")}'
                 for agent in agents
             ],
+            "# HELP yimi_run_success_rate_ratio Fraction of runs completed successfully.",
+            "# TYPE yimi_run_success_rate_ratio gauge",
+            f"yimi_run_success_rate_ratio {metrics['success_rate']}",
+            "# HELP yimi_run_failed_total Number of runs that failed.",
+            "# TYPE yimi_run_failed_total gauge",
+            f"yimi_run_failed_total {metrics['failed_runs']}",
+            "# HELP yimi_run_execution_duration_p95_milliseconds P95 execution time among the latest 5000 successful runs.",
+            "# TYPE yimi_run_execution_duration_p95_milliseconds gauge",
+            f"yimi_run_execution_duration_p95_milliseconds {metrics['p95_execution_duration_ms']}",
             "",
         ]
     )

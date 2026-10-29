@@ -10,10 +10,20 @@ class Base(DeclarativeBase):
 
 class AgentRunRecord(Base):
     __tablename__ = "agent_runs"
-    __table_args__ = (Index("ix_agent_runs_tenant_created", "tenant_id", "created_at"),)
+    __table_args__ = (
+        Index("ix_agent_runs_tenant_created", "tenant_id", "created_at"),
+        Index(
+            "uq_agent_runs_tenant_idempotency_key",
+            "tenant_id",
+            "idempotency_key",
+            unique=True,
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     tenant_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    request_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     goal: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     result: Mapped[str] = mapped_column(Text, nullable=False)
@@ -22,6 +32,7 @@ class AgentRunRecord(Base):
     processing_started_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     usage: Mapped[list["UsageRecord"]] = relationship(
         back_populates="run", cascade="all, delete-orphan"

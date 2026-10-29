@@ -16,10 +16,14 @@ def create_queued_run(
     tenant_id: str,
     goal: str,
     approval_required: bool = False,
+    idempotency_key: str | None = None,
+    request_hash: str | None = None,
 ) -> AgentRunRecord:
     run = AgentRunRecord(
         id=str(uuid4()),
         tenant_id=tenant_id,
+        idempotency_key=idempotency_key,
+        request_hash=request_hash,
         goal=goal,
         status="queued",
         result="Waiting for the GPT-4o worker.",
@@ -84,8 +88,8 @@ async def run_workflow(
         quote = quote_token_usage(input_tokens, output_tokens, monthly_tokens or 0)
         now = datetime.now(timezone.utc)
         run.status = "pending_approval" if run.approval_required else "completed"
-        run.processing_started_at = None
         run.result = answer
+        run.finished_at = datetime.now(timezone.utc)
         run.steps = [
             {
                 "agent": "gpt-4o",
@@ -146,7 +150,7 @@ async def run_workflow(
         heartbeat(session, "orchestrator", "healthy")
     except Exception as error:
         run.status = "failed"
-        run.processing_started_at = None
+        run.finished_at = datetime.now(timezone.utc)
         run.result = "The GPT-4o request failed; no automatic retry was made."
         run.steps = [
             {
@@ -184,11 +188,11 @@ def expire_stuck_runs(session: Session, older_than_seconds: int = 180) -> int:
             started_at = started_at.replace(tzinfo=timezone.utc)
         if started_at.timestamp() <= deadline:
             run.status = "failed"
+            run.finished_at = datetime.now(timezone.utc)
             run.result = (
                 "Worker stopped during processing; automatic retry disabled to avoid "
                 "duplicate provider charges."
             )
-            run.processing_started_at = None
             expired += 1
     if expired:
         session.commit()

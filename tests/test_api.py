@@ -37,7 +37,7 @@ from api.routes import (
     stripe_webhook,
 )
 from config.settings import token_price_tiers
-from database.models import Base, BillingInvoice
+from database.models import AgentRunRecord, Base, BillingInvoice
 from database.session import get_engine, get_session_factory, initialize_database
 from monitoring.health import agent_health
 
@@ -97,6 +97,9 @@ class AgentApiTests(unittest.TestCase):
         self.assertGreaterEqual(preview["billable_cents"], 50)
         self.assertEqual(self.fake_client.completions.request["model"], "gpt-4o")
         self.assertNotIn("tools", self.fake_client.completions.request)
+        self.assertIsNotNone(run["finished_at"])
+        self.assertIsNotNone(run["execution_duration_ms"])
+        self.assertGreaterEqual(run["execution_duration_ms"], 0)
 
         with self.assertRaises(HTTPException) as error:
             get_agent_run(run["id"], self.session, "tenant-b")
@@ -291,6 +294,36 @@ class AgentApiTests(unittest.TestCase):
             "completed",
         )
 
+    def test_idempotency_key_prevents_duplicate_runs_and_scopes_to_tenant(self) -> None:
+        request = AgentRunRequest(goal="same request")
+        first = create_agent_run(request, self.session, "tenant-a", "request-123")
+        repeated = create_agent_run(request, self.session, "tenant-a", "request-123")
+        other_tenant = create_agent_run(
+            request, self.session, "tenant-b", "request-123"
+        )
+
+        self.assertEqual(first["id"], repeated["id"])
+        self.assertNotEqual(first["id"], other_tenant["id"])
+        self.assertEqual(
+            self.session.query(AgentRunRecord).filter_by(tenant_id="tenant-a").count(),
+            1,
+        )
+        with self.assertRaises(HTTPException) as conflict:
+            create_agent_run(
+                AgentRunRequest(goal="different request"),
+                self.session,
+                "tenant-a",
+                "request-123",
+            )
+        self.assertEqual(conflict.exception.status_code, 409)
+
+    def test_idempotency_key_must_be_trimmed(self) -> None:
+        with self.assertRaises(HTTPException) as error:
+            create_agent_run(
+                AgentRunRequest(goal="bad key"), self.session, "tenant-a", " key "
+            )
+        self.assertEqual(error.exception.status_code, 400)
+
     def test_api_key_and_monthly_budget_protect_queue_admission(self) -> None:
         with patch.dict(os.environ, {"OPENAI_API_KEY": ""}):
             with self.assertRaises(HTTPException) as missing_key:
@@ -349,6 +382,9 @@ class AgentApiTests(unittest.TestCase):
         }
         self.assertIn("approval_required", run_columns)
         self.assertIn("processing_started_at", run_columns)
+        self.assertIn("finished_at", run_columns)
+        self.assertIn("idempotency_key", run_columns)
+        self.assertIn("request_hash", run_columns)
         self.assertIn("input_tokens", usage_columns)
         self.assertIn("sell_price_micro_usd", usage_columns)
         legacy_engine.dispose()
@@ -389,6 +425,20 @@ class AgentApiTests(unittest.TestCase):
         self.assertEqual(metrics["total_tokens"], 150_000)
         self.assertEqual(metrics["input_tokens"], 100_000)
         self.assertEqual(metrics["output_tokens"], 50_000)
+
+    def test_admin_metrics_report_success_rate_and_p95_duration(self) -> None:
+        run = create_queued_run(self.session, "tenant-a", "measured run")
+        run.status = "completed"
+        run.processing_started_at = datetime.now(timezone.utc) - timedelta(seconds=3)
+        run.finished_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        self.session.commit()
+
+        metrics = admin_metrics(self.session)
+
+        self.assertEqual(metrics["total_runs"], 1)
+        self.assertEqual(metrics["successful_runs"], 1)
+        self.assertEqual(metrics["success_rate"], 1)
+        self.assertGreaterEqual(metrics["p95_execution_duration_ms"], 1999)
 
     def test_prometheus_metrics_include_queue_and_agent_health(self) -> None:
         create_queued_run(self.session, "tenant-a", "pending task")

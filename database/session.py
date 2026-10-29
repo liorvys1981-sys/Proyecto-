@@ -64,6 +64,25 @@ def initialize_database() -> None:
             connection.execute(
                 text("ALTER TABLE agent_runs ADD COLUMN processing_started_at TIMESTAMP")
             )
+        if "idempotency_key" not in run_columns:
+            connection.execute(
+                text("ALTER TABLE agent_runs ADD COLUMN idempotency_key VARCHAR(128)")
+            )
+        if "request_hash" not in run_columns:
+            connection.execute(
+                text("ALTER TABLE agent_runs ADD COLUMN request_hash VARCHAR(64)")
+            )
+        if "finished_at" not in run_columns:
+            connection.execute(
+                text("ALTER TABLE agent_runs ADD COLUMN finished_at TIMESTAMP")
+            )
+        connection.execute(
+            text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "uq_agent_runs_tenant_idempotency_key "
+                "ON agent_runs (tenant_id, idempotency_key)"
+            )
+        )
 
 
 def get_session() -> Generator[Session, None, None]:
