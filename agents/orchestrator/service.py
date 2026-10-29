@@ -5,10 +5,34 @@ from uuid import uuid4
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
-from agents.monetization.token_pricing import quote_token_usage
+from agents.analytics.service import analyze_completion
+from agents.bus import publish_decision
+from agents.contracts import AgentDecision
+from agents.monetization.service import assess_run_cost
+from agents.orchestrator.planning import plan_run
+from agents.resources.service import measure_async, resource_decision
+from agents.security.service import assess_request
 from core.llm.gpt4o import generate
-from database.models import AgentRunRecord, UsageRecord
-from monitoring.health import heartbeat
+from database.models import AgentDecisionRecord, AgentRunRecord, UsageRecord
+from monitoring.health import diagnose_runtime, heartbeat
+
+
+def _record_decisions(
+    session: Session, run: AgentRunRecord, decisions: list[AgentDecision]
+) -> None:
+    for decision in decisions:
+        record = AgentDecisionRecord(
+            id=str(uuid4()),
+            tenant_id=run.tenant_id,
+            run_id=run.id,
+            agent=decision.agent,
+            contract_version=decision.contract_version,
+            status=decision.status,
+            evidence=decision.evidence,
+            created_at=datetime.now(timezone.utc),
+        )
+        session.add(record)
+        publish_decision(session, record)
 
 
 def create_queued_run(
@@ -70,8 +94,29 @@ def claim_next_run(session: Session) -> AgentRunRecord | None:
 async def run_workflow(
     session: Session, run: AgentRunRecord, client: Any
 ) -> AgentRunRecord:
+    decisions: list[AgentDecision] = []
     try:
-        answer, input_tokens, output_tokens = await generate(client, run.goal)
+        plan = plan_run(run.goal, run.approval_required)
+        security = assess_request(run.goal, run.approval_required)
+        diagnostics = diagnose_runtime(session)
+        decisions.extend(
+            [
+                plan,
+                security,
+                AgentDecision(
+                    agent="devops",
+                    status=(
+                        "warning"
+                        if diagnostics["stale_processing_runs"]
+                        else "diagnosed"
+                    ),
+                    evidence=diagnostics,
+                ),
+            ]
+        )
+        (answer, input_tokens, output_tokens), cpu_milliseconds, memory_bytes = (
+            await measure_async(generate, client, run.goal)
+        )
         month_start = datetime.now(timezone.utc).replace(
             day=1, hour=0, minute=0, second=0, microsecond=0
         )
@@ -85,40 +130,37 @@ async def run_workflow(
                 UsageRecord.created_at >= month_start,
             )
         )
-        quote = quote_token_usage(input_tokens, output_tokens, monthly_tokens or 0)
+        monetization, quote = assess_run_cost(
+            input_tokens, output_tokens, monthly_tokens or 0
+        )
+        resources = resource_decision(cpu_milliseconds, memory_bytes)
+        analytics = analyze_completion(answer, input_tokens, output_tokens)
+        decisions.extend([resources, monetization, analytics])
         now = datetime.now(timezone.utc)
-        run.status = "pending_approval" if run.approval_required else "completed"
+        approval_required = (
+            run.approval_required or security.status == "review_required"
+        )
+        run.approval_required = approval_required
+        run.status = "pending_approval" if approval_required else "completed"
         run.result = answer
         run.finished_at = datetime.now(timezone.utc)
         run.steps = [
             {
-                "agent": "gpt-4o",
-                "status": "completed",
-                "detail": (
-                    f"Model GPT-4o; {input_tokens} input tokens, "
-                    f"{output_tokens} output tokens."
-                ),
-            },
-            {
-                "agent": "security",
-                "status": (
-                    "approval_required" if run.approval_required else "reviewed"
-                ),
-                "detail": (
-                    "Human approval required before acting; no tools are available."
-                    if run.approval_required
-                    else "No tools or external actions are available."
-                ),
-            },
+                "agent": decision.agent,
+                "status": decision.status,
+                "detail": decision.evidence,
+            }
+            for decision in decisions
         ]
-        if run.approval_required:
+        if approval_required:
             run.steps.append(
                 {
-                    "agent": "execution",
                     "status": "pending_approval",
-                    "detail": "Approval is informational only; no external action is available.",
+                    "agent": "human_approval",
+                    "detail": "High-impact requests require review; no external tools are enabled.",
                 }
             )
+        _record_decisions(session, run, decisions)
         session.add(
             UsageRecord(
                 id=str(uuid4()),
@@ -126,8 +168,8 @@ async def run_workflow(
                 run_id=run.id,
                 agent="gpt-4o",
                 feature="text_completion",
-                cpu_milliseconds=0,
-                memory_bytes=0,
+                cpu_milliseconds=cpu_milliseconds,
+                memory_bytes=memory_bytes,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 provider_cost_micro_usd=quote["provider_cost_micro_usd"],
@@ -159,6 +201,14 @@ async def run_workflow(
                 "detail": f"Provider error: {type(error).__name__}.",
             }
         ]
+        decisions.append(
+            AgentDecision(
+                agent="orchestrator",
+                status="failed",
+                evidence={"error_type": type(error).__name__},
+            )
+        )
+        _record_decisions(session, run, decisions)
         heartbeat(session, "gpt4o", "unhealthy", type(error).__name__)
     session.commit()
     session.refresh(run)

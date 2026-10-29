@@ -8,6 +8,7 @@ La organización toma como referencia conceptual la estructura de [ECO.IA](https
 
 - `POST /v1/agent-runs` encola una tarea durable y responde `202`. El worker la procesa usando una única llamada a `gpt-4o`, con salida limitada, sin herramientas y sin reintentos automáticos del SDK. Envía un `Idempotency-Key` único por solicitud para recibir el mismo run si el cliente reintenta el POST; reutilizarlo con otro contenido devuelve `409`.
 - `GET /v1/agent-runs/{id}` consulta estado y resultado de una tarea del tenant autenticado: `queued`, `processing`, `completed`, `pending_approval` o `failed`.
+- `GET /v1/agent-runs/{id}/decisions` devuelve el ledger de decisiones por agente, con versión de contrato y evidencia acotada, validado por tenant.
 - `GET /v1/billing/preview` muestra tokens de entrada/salida, costo estimado del proveedor, precio de venta por nivel y margen estimado para consumos todavía no facturados.
 - `POST /v1/billing/checkout` cobra mediante Stripe solo tras consentimiento explícito y confirmación del importe exacto mostrado. El cliente confirma el pago en Stripe; nunca hay un cargo silencioso.
 - `/v1/billing/webhook` verifica firma, factura, tenant, sesión, importe, moneda y estado de pago; evita procesar el mismo evento más de una vez.
@@ -80,7 +81,11 @@ Límites protectores configurables:
 
 Los cálculos de costo y margen se basan en tarifas configuradas, no en la factura final del proveedor; no garantizan ganancias. El gasto de infraestructura (servidor, base de datos, Stripe, red) es aparte del costo de tokens.
 
-## Seguridad, recuperación y monitoreo
+## Orquestación multiagente, recuperación y monitoreo
+
+Cada run ejecuta etapas locales en orden: planificación, política de seguridad, diagnóstico de base de datos/cola, una llamada GPT‑4o, medición de recursos, estimación de precio y señales analíticas. Las decisiones se guardan en `agent_decisions` junto al resultado. El orquestador agrega las seis respuestas de etapa mediante eventos `agent.decision` versionados en una outbox SQL transaccional; las entregas se confirman, reintentan hasta tres veces con backoff y pasan a `dead_letter` al agotarse los intentos o expirar repetidamente la concesión. `/v1/admin/orchestrator/report` muestra colaboraciones verificadas y el tamaño de la DLQ.
+
+Los seis módulos sí ejecutan lógica acotada en el worker compartido; no son seis servicios independientes ni seis llamadas a modelos. El agente de seguridad aplica un clasificador por palabras clave como revisión adicional, no como motor exhaustivo de políticas. Recursos mide CPU del hilo y memoria máxima del proceso (esta última no es asignación exclusiva por tarea). Analytics registra caracteres/tokens y métricas operativas, no calidad semántica. El agente DevOps diagnostica y señala trabajos atascados; no modifica infraestructura. Ningún agente puede usar herramientas externas o aprobar operaciones privilegiadas.
 
 Los prompts se envían a OpenAI para generar respuestas. No se envían herramientas ni permisos para realizar compras, trading, despliegues u operaciones externas. Un fallo del proveedor marca la tarea como `failed` sin reintento automático.
 
@@ -97,3 +102,5 @@ El informe del orquestador etiqueta con precisión los módulos especialistas co
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+Las pruebas automatizadas verifican el pipeline de seis etapas con cliente GPT simulado, aislamiento tenant, persistencia de decisiones/outbox, coordinación de eventos, duplicados, reintentos, leases y DLQ. El uso del cliente simulado prueba la lógica de integración, no acredita conectividad real, exactitud de facturación OpenAI, Stripe Live, restauración de backups o comportamiento en producción. Ejecuta una prueba de proveedor real solo con credenciales de prueba y límites de gasto, y nunca incluyas secretos en commits o informes.

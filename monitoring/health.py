@@ -1,12 +1,14 @@
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from database.models import AgentHeartbeat
+from database.models import AgentHeartbeat, AgentRunRecord
 
-AGENT_NAMES = ("gpt4o", "orchestrator", "billing")
+AGENT_NAMES = ("gpt4o", "orchestrator", "billing", "message_bus")
+PROCESS_HEARTBEAT_NAMES = ("gpt4o", "orchestrator", "billing")
 HEARTBEAT_TIMEOUT = timedelta(seconds=120)
+STALE_RUN_TIMEOUT = timedelta(seconds=180)
 
 
 def heartbeat(session: Session, name: str, state: str = "healthy", error: str | None = None):
@@ -54,3 +56,27 @@ def agent_health(session: Session) -> list[dict[str, str]]:
             }
         )
     return results
+
+
+def diagnose_runtime(session: Session) -> dict:
+    session.execute(select(1))
+    stale_before = datetime.now(timezone.utc) - STALE_RUN_TIMEOUT
+    counts = dict(
+        session.execute(
+            select(AgentRunRecord.status, func.count()).group_by(AgentRunRecord.status)
+        ).all()
+    )
+    stale_processing = session.scalar(
+        select(func.count(AgentRunRecord.id)).where(
+            AgentRunRecord.status == "processing",
+            AgentRunRecord.processing_started_at < stale_before,
+        )
+    )
+    return {
+        "database": "healthy",
+        "queued_runs": counts.get("queued", 0),
+        "processing_runs": counts.get("processing", 0),
+        "failed_runs": counts.get("failed", 0),
+        "stale_processing_runs": stale_processing or 0,
+        "automatic_recovery_enabled": False,
+    }

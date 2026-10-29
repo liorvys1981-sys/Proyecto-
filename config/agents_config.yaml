@@ -7,24 +7,24 @@ agents:
   - id: master_orchestrator
     module: agents.orchestrator.service
     status: implemented
-    scope: Durable task queue and GPT-4o dispatch; executive report is read-only and advisory.
+    scope: Durable task queue, single GPT-4o dispatch, six-stage pipeline and decision-event coordination.
   - id: monetization
     module: agents.monetization.token_pricing
     status: implemented
     scope: Local token cost estimation and configurable resale tiers; not an autonomous billing worker.
   - id: devops
     module: monitoring.health
-    status: partial
-    scope: Health checks and alerts; no autonomous infrastructure changes.
+    status: implemented
+    scope: Database/queue diagnosis and heartbeat alerts; no autonomous infrastructure changes.
   - id: resources
     module: agents.resources.service
-    status: partial
-    scope: Resource measurement helper exists but is not wired into run accounting.
+    status: implemented
+    scope: Measures worker CPU time and process peak memory for each provider call.
   - id: security
     module: agents.security.service
     status: partial
-    scope: Human approval flag and restricted no-tools execution; no policy engine.
+    scope: Keyword-based high-impact review and no-tools guardrail; not a comprehensive policy engine.
   - id: analytics
-    module: api.routes.admin_metrics
+    module: agents.analytics.service
     status: partial
-    scope: Operational and usage aggregates; no quality or customer profitability analysis.
+    scope: Records goal fingerprint, output length and token signals; no semantic quality or net-profit validation.

@@ -27,3 +27,12 @@ groups:
         annotations:
           summary: YIMI's task queue is backing up
           description: "More than 5 tasks have been queued for at least 5 minutes."
+
+      - alert: YimiAgentMessagesDeadLetter
+        expr: yimi_agent_messages_dead_letter > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: YIMI has undelivered agent events
+          description: "At least one agent event exhausted its delivery attempts."

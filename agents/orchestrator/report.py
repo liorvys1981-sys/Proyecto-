@@ -4,7 +4,12 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from config.settings import max_queued_runs_per_tenant
-from database.models import AgentRunRecord, UsageRecord
+from database.models import (
+    AgentCoordinationRecord,
+    AgentMessageRecord,
+    AgentRunRecord,
+    UsageRecord,
+)
 from monitoring.health import agent_health
 
 SPECIALIST_MODULES = (
@@ -65,6 +70,13 @@ def build_executive_report(session: Session) -> dict:
             func.coalesce(func.sum(UsageRecord.sell_price_micro_usd), 0),
         )
     ).one()
+    message_counts = dict(
+        session.execute(
+            select(AgentMessageRecord.status, func.count()).group_by(
+                AgentMessageRecord.status
+            )
+        ).all()
+    )
     queue = {
         "queued": run_counts.get("queued", 0),
         "processing": run_counts.get("processing", 0),
@@ -123,6 +135,15 @@ def build_executive_report(session: Session) -> dict:
             "estimated_provider_cost_micro_usd": usage[3],
             "estimated_sell_price_micro_usd": usage[4],
             "revenue_source": "estimated_usage; payment reconciliation is separate",
+        },
+        "collaboration": {
+            "verified_runs": session.scalar(
+                select(func.count(AgentCoordinationRecord.run_id))
+            )
+            or 0,
+            "messages_queued": message_counts.get("queued", 0),
+            "messages_processing": message_counts.get("processing", 0),
+            "messages_dead_letter": message_counts.get("dead_letter", 0),
         },
         "recommendations": recommendations[:3],
         "automated_actions_taken": [],

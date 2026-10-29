@@ -11,12 +11,13 @@ from unittest.mock import patch
 
 from fastapi import HTTPException
 from fastapi.security import HTTPAuthorizationCredentials
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import create_engine, inspect, select
 from sqlalchemy.pool import StaticPool
 from starlette.requests import Request
 
 os.environ["DATABASE_URL"] = "sqlite://"
 
+from agents.bus import process_next_message, publish_decision
 from agents.orchestrator.service import (
     create_queued_run,
     expire_stuck_runs,
@@ -31,6 +32,7 @@ from api.routes import (
     create_agent_run,
     create_checkout,
     get_agent_run,
+    get_agent_run_decisions,
     orchestrator_report,
     prometheus_metrics,
     require_admin,
@@ -38,7 +40,14 @@ from api.routes import (
     stripe_webhook,
 )
 from config.settings import token_price_tiers
-from database.models import AgentRunRecord, Base, BillingInvoice
+from database.models import (
+    AgentCoordinationRecord,
+    AgentDecisionRecord,
+    AgentMessageRecord,
+    AgentRunRecord,
+    Base,
+    BillingInvoice,
+)
 from database.session import get_engine, get_session_factory, initialize_database
 from monitoring.health import agent_health
 
@@ -104,10 +113,175 @@ class AgentApiTests(unittest.TestCase):
         self.assertIsNotNone(run["finished_at"])
         self.assertIsNotNone(run["execution_duration_ms"])
         self.assertGreaterEqual(run["execution_duration_ms"], 0)
+        decisions = get_agent_run_decisions(
+            run["id"], self.session, "tenant-a"
+        )["decisions"]
+        self.assertEqual(
+            {item["agent"] for item in decisions},
+            {
+                "orchestrator",
+                "security",
+                "devops",
+                "resources",
+                "monetization",
+                "analytics",
+            },
+        )
+        self.assertTrue(all(item["contract_version"] == 1 for item in decisions))
+        self.assertGreaterEqual(run["usage"][0]["memory_bytes"], 0)
+        outbox = self.session.scalars(
+            select(AgentMessageRecord).where(AgentMessageRecord.run_id == run["id"])
+        ).all()
+        self.assertEqual(len(outbox), 6)
+        self.assertEqual(outbox[0].event_type, "agent.decision")
+        first_decision = self.session.scalar(
+            select(AgentDecisionRecord).where(
+                AgentDecisionRecord.run_id == run["id"]
+            )
+        )
+        existing_message_id = publish_decision(self.session, first_decision).id
+        self.assertIn(
+            existing_message_id,
+            {item.id for item in outbox if item.dedupe_key == first_decision.id},
+        )
+        for _ in range(6):
+            self.assertTrue(process_next_message(self.session))
+        coordination = self.session.get(AgentCoordinationRecord, run["id"])
+        self.assertEqual(coordination.status, "verified")
+        self.assertEqual(
+            set(coordination.participating_agents),
+            {
+                "orchestrator",
+                "security",
+                "devops",
+                "resources",
+                "monetization",
+                "analytics",
+            },
+        )
+        self.session.expire_all()
+        self.assertEqual(
+            self.session.get(AgentCoordinationRecord, run["id"]).status, "verified"
+        )
 
         with self.assertRaises(HTTPException) as error:
             get_agent_run(run["id"], self.session, "tenant-b")
         self.assertEqual(error.exception.status_code, 404)
+        with self.assertRaises(HTTPException) as decision_error:
+            get_agent_run_decisions(run["id"], self.session, "tenant-b")
+        self.assertEqual(decision_error.exception.status_code, 404)
+
+    def test_security_agent_holds_high_impact_request_for_approval(self) -> None:
+        run = create_agent_run(
+            AgentRunRequest(goal="delete customer data"), self.session, "tenant-a"
+        )
+        self.assertTrue(asyncio.run(process_next_run(self.session, self.fake_client)))
+        result = get_agent_run(run["id"], self.session, "tenant-a")
+        decisions = get_agent_run_decisions(run["id"], self.session, "tenant-a")
+
+        self.assertEqual(result["status"], "pending_approval")
+        security = next(
+            item for item in decisions["decisions"] if item["agent"] == "security"
+        )
+        self.assertEqual(security["status"], "review_required")
+        self.assertFalse(security["evidence"]["external_actions_permitted"])
+
+    def test_agent_message_failure_retries_then_enters_dead_letter_queue(self) -> None:
+        run = create_queued_run(self.session, "tenant-a", "message dlq run")
+        message = AgentMessageRecord(
+            id="message-dlq-test",
+            event_type="agent.decision",
+            schema_version=1,
+            tenant_id="tenant-a",
+            correlation_id=run.id,
+            run_id=run.id,
+            sender="security",
+            target="orchestrator",
+            dedupe_key="dlq-test-key",
+            payload={"decision_id": "missing"},
+            status="queued",
+            attempts=0,
+            max_attempts=2,
+            available_at=datetime.now(timezone.utc),
+            created_at=datetime.now(timezone.utc),
+        )
+        self.session.add(message)
+        self.session.commit()
+
+        def fail_handler(_session, _message):
+            raise RuntimeError("handler unavailable")
+
+        self.assertTrue(process_next_message(self.session, fail_handler))
+        self.session.refresh(message)
+        self.assertEqual(message.status, "queued")
+        self.assertEqual(message.attempts, 1)
+        message.available_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        self.session.commit()
+
+        self.assertTrue(process_next_message(self.session, fail_handler))
+        self.session.refresh(message)
+        self.assertEqual(message.status, "dead_letter")
+        self.assertEqual(message.attempts, 2)
+        self.assertEqual(message.last_error, "RuntimeError")
+
+    def test_expired_message_lease_can_be_reclaimed(self) -> None:
+        run = create_queued_run(self.session, "tenant-a", "message lease run")
+        message = AgentMessageRecord(
+            id="message-lease-test",
+            event_type="agent.decision",
+            schema_version=1,
+            tenant_id="tenant-a",
+            correlation_id=run.id,
+            run_id=run.id,
+            sender="security",
+            target="orchestrator",
+            dedupe_key="lease-test-key",
+            payload={"decision_id": "missing"},
+            status="processing",
+            attempts=1,
+            max_attempts=3,
+            available_at=datetime.now(timezone.utc),
+            locked_at=datetime.now(timezone.utc) - timedelta(seconds=120),
+            created_at=datetime.now(timezone.utc),
+        )
+        self.session.add(message)
+        self.session.commit()
+
+        def acknowledge(_session, leased_message):
+            leased_message.status = "delivered"
+
+        self.assertTrue(process_next_message(self.session, acknowledge))
+        self.session.refresh(message)
+        self.assertEqual(message.status, "delivered")
+        self.assertEqual(message.attempts, 2)
+
+    def test_expired_message_lease_at_attempt_limit_moves_to_dlq(self) -> None:
+        run = create_queued_run(self.session, "tenant-a", "message exhausted lease")
+        message = AgentMessageRecord(
+            id="message-expired-dlq-test",
+            event_type="agent.decision",
+            schema_version=1,
+            tenant_id="tenant-a",
+            correlation_id=run.id,
+            run_id=run.id,
+            sender="security",
+            target="orchestrator",
+            dedupe_key="expired-dlq-test-key",
+            payload={"decision_id": "missing"},
+            status="processing",
+            attempts=3,
+            max_attempts=3,
+            available_at=datetime.now(timezone.utc),
+            locked_at=datetime.now(timezone.utc) - timedelta(seconds=120),
+            created_at=datetime.now(timezone.utc),
+        )
+        self.session.add(message)
+        self.session.commit()
+
+        self.assertFalse(process_next_message(self.session))
+        self.session.refresh(message)
+        self.assertEqual(message.status, "dead_letter")
+        self.assertEqual(message.last_error, "DeliveryLeaseExpired")
 
     def test_risky_run_waits_for_admin_approval(self) -> None:
         run = self.enqueue_and_process("risky action", requires_approval=True)
@@ -483,6 +657,7 @@ class AgentApiTests(unittest.TestCase):
         self.assertIn('yimi_agent_healthy{agent="gpt4o"} 0', metrics)
         self.assertIn("yimi_run_success_rate_ratio 0.0", metrics)
         self.assertIn("yimi_run_execution_duration_p95_milliseconds 0", metrics)
+        self.assertIn("yimi_agent_messages_dead_letter 0", metrics)
 
     def test_tier_configuration_is_monotonic_and_threshold_based(self) -> None:
         self.assertEqual(token_price_tiers()[0]["monthly_tokens"], 0)

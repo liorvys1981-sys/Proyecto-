@@ -108,3 +108,81 @@ class AgentHeartbeat(Base):
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class AgentDecisionRecord(Base):
+    __tablename__ = "agent_decisions"
+    __table_args__ = (
+        Index(
+            "ix_agent_decisions_tenant_run",
+            "tenant_id",
+            "run_id",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("agent_runs.id"), nullable=False, index=True
+    )
+    agent: Mapped[str] = mapped_column(String(80), nullable=False)
+    contract_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    evidence: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class AgentMessageRecord(Base):
+    __tablename__ = "agent_messages"
+    __table_args__ = (
+        Index(
+            "uq_agent_messages_target_dedupe",
+            "target",
+            "dedupe_key",
+            unique=True,
+        ),
+        Index(
+            "ix_agent_messages_delivery",
+            "status",
+            "available_at",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    event_type: Mapped[str] = mapped_column(String(120), nullable=False)
+    schema_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    tenant_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    correlation_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("agent_runs.id"), nullable=False, index=True
+    )
+    sender: Mapped[str] = mapped_column(String(80), nullable=False)
+    target: Mapped[str] = mapped_column(String(80), nullable=False)
+    dedupe_key: Mapped[str] = mapped_column(String(200), nullable=False)
+    payload: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    locked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    acknowledged_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class AgentCoordinationRecord(Base):
+    __tablename__ = "agent_coordinations"
+
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("agent_runs.id"), primary_key=True
+    )
+    tenant_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    participating_agents: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    verified_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

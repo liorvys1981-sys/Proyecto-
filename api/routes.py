@@ -31,6 +31,9 @@ from config.settings import (
     validate_token_pricing,
 )
 from database.models import (
+    AgentCoordinationRecord,
+    AgentDecisionRecord,
+    AgentMessageRecord,
     AgentRunRecord,
     BillingInvoice,
     ProcessedWebhook,
@@ -137,6 +140,8 @@ def _serialize_run(run: AgentRunRecord) -> dict:
                 "input_tokens": usage.input_tokens,
                 "output_tokens": usage.output_tokens,
                 "total_tokens": usage.input_tokens + usage.output_tokens,
+                "cpu_milliseconds": usage.cpu_milliseconds,
+                "memory_bytes": usage.memory_bytes,
                 "provider_cost_micro_usd": usage.provider_cost_micro_usd,
                 "input_provider_cost_micro_usd": (
                     usage.input_provider_cost_micro_usd
@@ -387,6 +392,40 @@ def get_agent_run(
     return _serialize_run(run)
 
 
+@router.get("/v1/agent-runs/{run_id}/decisions")
+def get_agent_run_decisions(
+    run_id: str, session: SessionDependency, tenant_id: TenantDependency
+) -> dict:
+    run = session.scalar(
+        select(AgentRunRecord.id).where(
+            AgentRunRecord.id == run_id, AgentRunRecord.tenant_id == tenant_id
+        )
+    )
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    decisions = session.scalars(
+        select(AgentDecisionRecord)
+        .where(
+            AgentDecisionRecord.run_id == run_id,
+            AgentDecisionRecord.tenant_id == tenant_id,
+        )
+        .order_by(AgentDecisionRecord.created_at, AgentDecisionRecord.agent)
+    ).all()
+    return {
+        "run_id": run_id,
+        "decisions": [
+            {
+                "agent": item.agent,
+                "contract_version": item.contract_version,
+                "status": item.status,
+                "evidence": item.evidence,
+                "created_at": item.created_at,
+            }
+            for item in decisions
+        ],
+    }
+
+
 @router.post("/v1/agent-runs/{run_id}/approve")
 def approve_agent_run(
     run_id: str,
@@ -400,7 +439,7 @@ def approve_agent_run(
         raise HTTPException(status_code=409, detail="Run is not awaiting approval")
     steps = [dict(step) for step in run.steps]
     for step in steps:
-        if step["agent"] == "execution":
+        if step["agent"] == "human_approval":
             step["status"] = "approved_simulation"
             step["detail"] = "Administrator approved a simulation; no external action was taken."
     run.steps = steps
@@ -673,6 +712,13 @@ def prometheus_metrics(session: SessionDependency) -> str:
             select(AgentRunRecord.status, func.count()).group_by(AgentRunRecord.status)
         ).all()
     )
+    message_counts = dict(
+        session.execute(
+            select(AgentMessageRecord.status, func.count()).group_by(
+                AgentMessageRecord.status
+            )
+        ).all()
+    )
     agents = agent_health(session)
     return "\n".join(
         [
@@ -713,6 +759,12 @@ def prometheus_metrics(session: SessionDependency) -> str:
             "# HELP yimi_run_execution_duration_p95_milliseconds P95 execution time among the latest 5000 successful runs.",
             "# TYPE yimi_run_execution_duration_p95_milliseconds gauge",
             f"yimi_run_execution_duration_p95_milliseconds {metrics['p95_execution_duration_ms']}",
+            "# HELP yimi_agent_messages_dead_letter Number of agent messages in the DLQ.",
+            "# TYPE yimi_agent_messages_dead_letter gauge",
+            f"yimi_agent_messages_dead_letter {message_counts.get('dead_letter', 0)}",
+            "# HELP yimi_agent_collaborations_verified Number of six-agent verified runs.",
+            "# TYPE yimi_agent_collaborations_verified gauge",
+            f"yimi_agent_collaborations_verified {session.scalar(select(func.count(AgentCoordinationRecord.run_id))) or 0}",
             "",
         ]
     )
